@@ -21,6 +21,8 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.12"
 prost = "0.13"
 tonic-build = "0.12"
+ratatui = "0.29"
+crossterm = "0.28"
 vektordist-core = { path = "crates/vektordist-core" }
 vektordist-proto = { path = "crates/vektordist-proto" }
 vektordist-cluster = { path = "crates/vektordist-cluster" }
@@ -34,4 +36,11 @@ description = "Laptop-first distributed sharded HNSW vector search engine with q
 
 [dependencies]
 clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+vektordist-cluster.workspace = true
 vektordist-core.workspace = true
+vektordist-proto.workspace = true

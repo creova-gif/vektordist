@@ -267,35 +267,35 @@ Critical gaps flagged: `0`.
 ## Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above. Run with Claude Code or Codex; checkbox as you ship.
 
-- [ ] **T1 (P1, human: ~4h / CC: ~15min)** — `workspace` — Initialize git repo, record ADR-001, scaffold 3-member-crate workspace with `deny(unwrap_used,expect_used)` and `cargo audit` CI
+- [x] **T1 (P1, human: ~4h / CC: ~15min)** — `workspace` — Initialize git repo, record ADR-001, scaffold 3-member-crate workspace with `deny(unwrap_used,expect_used)` and `cargo audit` CI
   - Surfaced by: Scope Challenge D1 + Code Quality CQ-2 + Architecture ARCH-3
   - Files: `Cargo.toml`, `src/main.rs`, `crates/vektordist-core/Cargo.toml`, `crates/vektordist-proto/Cargo.toml`, `crates/vektordist-cluster/Cargo.toml`, `.github/workflows/ci.yml`, `docs/adr/001-m1-workspace-and-coordinator.md`
   - Verify: `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace`
-- [ ] **T2 (P1, human: ~1d / CC: ~30min)** — `vektordist-core` — Implement contiguous `Vec<f32>` `VectorArena`, exact cosine/L2 search, and M1.0 `100k x 768d` scan+RSS baseline benchmark
+- [x] **T2 (P1, human: ~1d / CC: ~30min)** — `vektordist-core` — Implement contiguous `Vec<f32>` `VectorArena`, exact cosine/L2 search, and M1.0 `100k x 768d` scan+RSS baseline benchmark
   - Surfaced by: Performance PERF-1 + Reality `perf-table`
   - Files: `crates/vektordist-core/src/arena.rs`, `crates/vektordist-core/src/exact.rs`, `crates/vektordist-core/benches/scan_baseline.rs`
   - Verify: `cargo test -p vektordist-core && cargo bench -p vektordist-core`
-- [ ] **T3 (P1, human: ~3d / CC: ~1h)** — `vektordist-core` — Implement HNSW graph construction/search with tombstone bitset and `recall@10 >= 95%` test against exact search
+- [x] **T3 (P1, human: ~3d / CC: ~1h)** — `vektordist-core` — Implement HNSW graph construction/search with tombstone bitset and `recall@10 >= 95%` test against exact search
   - Surfaced by: Test Review M1.2
   - Files: `crates/vektordist-core/src/hnsw.rs`, `crates/vektordist-core/tests/hnsw_recall.rs`
   - Verify: `cargo test -p vektordist-core --test hnsw_recall -- --nocapture`
-- [ ] **T4 (P1, human: ~2d / CC: ~45min)** — `vektordist-core` — Implement CRC32-framed WAL with `fsync`, safe partial-tail truncation, and mid-file corruption error tests
+- [x] **T4 (P1, human: ~2d / CC: ~45min)** — `vektordist-core` — Implement CRC32-framed WAL with `fsync`, safe partial-tail truncation, and mid-file corruption error tests
   - Surfaced by: Code Quality CQ-1
   - Files: `crates/vektordist-core/src/wal.rs`, `crates/vektordist-core/tests/wal_recovery.rs`
   - Verify: `cargo test -p vektordist-core --test wal_recovery`
-- [ ] **T5 (P1, human: ~1d / CC: ~30min)** — `vektordist-proto` — Define packed-bytes Tonic gRPC schemas (`ShardReplicaRpc` + `TopologyRpc`) with `shard_epoch` fencing and checked-in Rust stubs
+- [x] **T5 (P1, human: ~1d / CC: ~30min)** — `vektordist-proto` — Define packed-bytes Tonic gRPC schemas (`ShardReplicaRpc` + `TopologyRpc`) with `shard_epoch` fencing and checked-in Rust stubs
   - Surfaced by: Architecture ARCH-1 + ARCH-2 + Performance PERF-2
   - Files: `crates/vektordist-proto/proto/vektordist.proto`, `crates/vektordist-proto/src/lib.rs`
   - Verify: `cargo check -p vektordist-proto` (without `protoc` installed)
-- [ ] **T6 (P1, human: ~5d / CC: ~2h)** — `vektordist-cluster` — Implement `ShardEngine` (per-shard `RwLock`), `W=2` quorum replication, `epoch` fencing, union WAL reconciliation, and `RECOVERING` dual-stream catch-up
+- [x] **T6 (P1, human: ~5d / CC: ~2h)** — `vektordist-cluster` — Implement `ShardEngine` (per-shard `RwLock`), `W=2` quorum replication, `epoch` fencing, union WAL reconciliation, and `RECOVERING` dual-stream catch-up
   - Surfaced by: Architecture ARCH-1 + ARCH-2 + Performance PERF-1 + PERF-2
   - Files: `crates/vektordist-cluster/src/node/`, `crates/vektordist-cluster/src/coord/`, `crates/vektordist-cluster/src/client.rs`
   - Verify: `cargo test -p vektordist-cluster`
-- [ ] **T7 (P1, human: ~3d / CC: ~1.5h)** — `vektordist-cli` — Implement `vektordist demo` supervisor, batched 1k-vec seeding, incremental 200-query exact recall heaps, write-ID verifier, and `ratatui` TUI with `k`/`a`/`r`/`q` cleanup
+- [x] **T7 (P1, human: ~3d / CC: ~1.5h)** — `vektordist-cli` — Implement `vektordist demo` supervisor, batched 1k-vec seeding, incremental 200-query exact recall heaps, write-ID verifier, and `ratatui` TUI with `k`/`a`/`r`/`q` cleanup
   - Surfaced by: Test Review M1.7
   - Files: `src/main.rs`, `src/cli/`, `src/tui/`
   - Verify: `cargo install --path . && vektordist demo --nodes 5 --vectors 100000 --dimensions 768 --replication-factor 3 --seed 42`
-- [ ] **T8 (P1, human: ~2d / CC: ~1h)** — `integration-tests` — Add multi-process `SIGKILL` failover, double-kill under-quorum, replacement catch-up, and stale-epoch E2E tests + `docs/FAILURE_MODEL.md`
+- [x] **T8 (P1, human: ~2d / CC: ~1h)** — `integration-tests` — Add multi-process `SIGKILL` failover, double-kill under-quorum, replacement catch-up, and stale-epoch E2E tests + `docs/FAILURE_MODEL.md`
   - Surfaced by: Test Review E2E Matrix
   - Files: `tests/failover_e2e.rs`, `docs/FAILURE_MODEL.md`
   - Verify: `cargo test --test failover_e2e -- --nocapture`
