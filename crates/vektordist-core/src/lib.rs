@@ -3,6 +3,8 @@
 
 pub mod arena;
 pub mod exact;
+pub mod hnsw;
+pub mod wal;
 
 use thiserror::Error;
 
@@ -111,6 +113,9 @@ pub enum VektorError {
 
     #[error("WAL corruption detected at byte offset {offset}")]
     WalCorruption { offset: u64 },
+
+    #[error("WAL I/O error: {0}")]
+    WalIo(String),
 }
 
 #[cfg(test)]

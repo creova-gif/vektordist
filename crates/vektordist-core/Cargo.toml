@@ -7,3 +7,4 @@ description = "Core exact search, HNSW index, flat vector arena, and CRC32 WAL p
 
 [dependencies]
 thiserror.workspace = true
+crc32fast.workspace = true
