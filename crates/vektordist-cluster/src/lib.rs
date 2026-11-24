@@ -1,7 +1,12 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::result_large_err)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 //! Distributed cluster control plane (`TopologyStore`) and data plane (`ShardEngine`, `ClusterClient`).
+
+pub mod client;
+pub mod coord;
+pub mod node;
 
 use vektordist_core::{ClusterConfig, Epoch, NodeId, ShardId, VektorError};
 
@@ -13,6 +18,28 @@ pub enum ShardState {
     DegradedOk,
     Recovering,
     UnderQuorum,
+}
+
+#[must_use]
+pub fn shard_state_to_u32(state: ShardState) -> u32 {
+    match state {
+        ShardState::Healthy => 0,
+        ShardState::Reconciling => 1,
+        ShardState::DegradedOk => 2,
+        ShardState::Recovering => 3,
+        ShardState::UnderQuorum => 4,
+    }
+}
+
+#[must_use]
+pub fn u32_to_shard_state(code: u32) -> ShardState {
+    match code {
+        0 => ShardState::Healthy,
+        1 => ShardState::Reconciling,
+        2 => ShardState::DegradedOk,
+        3 => ShardState::Recovering,
+        _ => ShardState::UnderQuorum,
+    }
 }
 
 /// Authoritative replica placement and epoch for a single logical shard.

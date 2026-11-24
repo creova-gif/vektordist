@@ -16,6 +16,11 @@ license = "Apache-2.0"
 thiserror = "2"
 crc32fast = "1"
 clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
 vektordist-core = { path = "crates/vektordist-core" }
 vektordist-proto = { path = "crates/vektordist-proto" }
 vektordist-cluster = { path = "crates/vektordist-cluster" }

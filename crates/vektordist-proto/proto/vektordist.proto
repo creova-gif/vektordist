@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package vektordist.v1;
+
+message WireWalRecord {
+  uint64 seq_no = 1;
+  uint64 write_id = 2;
+  uint32 op_kind = 3; // 1 = Upsert, 2 = Delete
+  uint64 vector_id = 4;
+  bytes vector_f32_le = 5;
+}
+
+message WireScoredId {
+  uint64 id = 1;
+  float score = 2;
+}
+
+message AppendQuorumRequest {
+  uint32 shard_id = 1;
+  uint64 expected_epoch = 2;
+  bool batched_fsync = 3;
+  repeated WireWalRecord records = 4;
+}
+
+message AppendQuorumResponse {
+  // 0 = OK, 1 = WRONG_EPOCH, 2 = QUORUM_UNAVAILABLE, 3 = INVALID_ARGUMENT, 4 = INTERNAL
+  uint32 status_code = 1;
+  uint64 current_epoch = 2;
+  repeated uint64 assigned_seq_nos = 3;
+  string error_message = 4;
+}
+
+message ReplicateWalRequest {
+  uint32 shard_id = 1;
+  uint64 epoch = 2;
+  bool batched_fsync = 3;
+  repeated WireWalRecord records = 4;
+}
+
+message ReplicateWalResponse {
+  uint32 status_code = 1;
+  uint64 current_epoch = 2;
+  uint64 last_seq_no = 3;
+  string error_message = 4;
+}
+
+message SearchShardRequest {
+  uint32 shard_id = 1;
+  uint64 expected_epoch = 2;
+  uint32 top_k = 3;
+  uint32 ef_search = 4;
+  bytes query_f32_le = 5;
+}
+
+message SearchShardResponse {
+  uint32 status_code = 1;
+  uint64 current_epoch = 2;
+  repeated WireScoredId hits = 3;
+  string error_message = 4;
+}
+
+message GetWalRecordsRequest {
+  uint32 shard_id = 1;
+  uint64 from_seq_no = 2;
+}
+
+message GetWalRecordsResponse {
+  uint32 status_code = 1;
+  uint64 current_epoch = 2;
+  uint64 last_seq_no = 3;
+  repeated WireWalRecord records = 4;
+}
+
+message ConfigureShardRequest {
+  uint32 shard_id = 1;
+  uint64 epoch = 2;
+  bool is_primary = 3;
+  repeated string follower_addrs = 4;
+  string recovering_follower_addr = 5;
+  // 0 = Healthy, 1 = Reconciling, 2 = DegradedOk, 3 = Recovering, 4 = UnderQuorum
+  uint32 state = 6;
+  uint32 write_quorum = 7;
+}
+
+message ConfigureShardResponse {
+  uint32 status_code = 1;
+  uint64 current_epoch = 2;
+  uint64 last_seq_no = 3;
+}
+
+message PingNodeRequest {
+  uint32 node_id = 1;
+}
+
+message PingNodeResponse {
+  uint32 node_id = 1;
+  bool alive = 2;
+  uint64 memory_bytes = 3;
+  uint64 live_vectors = 4;
+  map<uint32, uint64> shard_last_seq_no = 5;
+}
+
+message WireShardAssignment {
+  uint32 shard_id = 1;
+  uint64 epoch = 2;
+  uint32 primary_node_id = 3;
+  string primary_addr = 4;
+  repeated uint32 follower_node_ids = 5;
+  repeated string follower_addrs = 6;
+  uint32 state = 7;
+}
+
+message WireNodeStatus {
+  uint32 node_id = 1;
+  string addr = 2;
+  bool alive = 3;
+  uint64 memory_bytes = 4;
+  uint64 live_vectors = 5;
+  uint32 owned_shards = 6;
+}
+
+message GetTopologyRequest {}
+
+message GetTopologyResponse {
+  uint32 num_shards = 1;
+  uint32 replication_factor = 2;
+  uint32 write_quorum = 3;
+  uint32 dimensions = 4;
+  uint32 metric = 5; // 0 = Cosine, 1 = L2
+  repeated WireShardAssignment shards = 6;
+  repeated WireNodeStatus nodes = 7;
+}
+
+service ShardReplicaRpc {
+  rpc AppendQuorum(AppendQuorumRequest) returns (AppendQuorumResponse);
+  rpc ReplicateWal(ReplicateWalRequest) returns (ReplicateWalResponse);
+  rpc SearchShard(SearchShardRequest) returns (SearchShardResponse);
+  rpc GetWalRecords(GetWalRecordsRequest) returns (GetWalRecordsResponse);
+  rpc ConfigureShard(ConfigureShardRequest) returns (ConfigureShardResponse);
+  rpc PingNode(PingNodeRequest) returns (PingNodeResponse);
+}
+
+service TopologyRpc {
+  rpc GetTopology(GetTopologyRequest) returns (GetTopologyResponse);
+}

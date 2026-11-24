@@ -6,4 +6,8 @@ license.workspace = true
 description = "Distributed shard replica runtime, M1 authoritative coordinator, and smart ClusterClient for VektorDist"
 
 [dependencies]
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 vektordist-core.workspace = true
+vektordist-proto.workspace = true

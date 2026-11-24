@@ -1,12 +1,31 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-//! Wire protocol module for VektorDist.
-//!
-//! Full Tonic/Prost packed-bytes gRPC definitions (`ShardReplicaRpc` and `TopologyRpc`)
-//! with checked-in Rust stubs are implemented in T5 (`M1.4`).
+//! Wire protocol module and checked-in Tonic/Prost gRPC stubs for VektorDist.
 
+use vektordist_core::exact::ScoredId;
+use vektordist_core::wal::{WalOp, WalRecord};
 use vektordist_core::VektorError;
+
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    dead_code
+)]
+pub mod v1 {
+    include!("vektordist.v1.rs");
+}
+
+pub const STATUS_OK: u32 = 0;
+pub const STATUS_WRONG_EPOCH: u32 = 1;
+pub const STATUS_QUORUM_UNAVAILABLE: u32 = 2;
+pub const STATUS_INVALID_ARGUMENT: u32 = 3;
+pub const STATUS_INTERNAL: u32 = 4;
+
+pub const WIRE_OP_UPSERT: u32 = 1;
+pub const WIRE_OP_DELETE: u32 = 2;
 
 /// Encode a slice of `f32` values into packed little-endian bytes for zero-varint wire transport.
 #[must_use]
@@ -41,6 +60,66 @@ pub fn decode_f32_le(bytes: &[u8], expected_dims: usize) -> Result<Vec<f32>, Vek
     Ok(out)
 }
 
+/// Convert a domain `WalRecord` into its wire representation.
+#[must_use]
+pub fn to_wire_wal_record(rec: &WalRecord) -> v1::WireWalRecord {
+    match &rec.op {
+        WalOp::Upsert { id, vector } => v1::WireWalRecord {
+            seq_no: rec.seq_no,
+            write_id: rec.write_id,
+            op_kind: WIRE_OP_UPSERT,
+            vector_id: *id,
+            vector_f32_le: encode_f32_le(vector),
+        },
+        WalOp::Delete { id } => v1::WireWalRecord {
+            seq_no: rec.seq_no,
+            write_id: rec.write_id,
+            op_kind: WIRE_OP_DELETE,
+            vector_id: *id,
+            vector_f32_le: Vec::new(),
+        },
+    }
+}
+
+/// Parse a `WireWalRecord` into a validated domain `WalRecord` at the gRPC boundary.
+pub fn from_wire_wal_record(
+    wire: &v1::WireWalRecord,
+    expected_dims: usize,
+) -> Result<WalRecord, VektorError> {
+    let op = match wire.op_kind {
+        WIRE_OP_UPSERT => {
+            let vector = decode_f32_le(&wire.vector_f32_le, expected_dims)?;
+            WalOp::Upsert {
+                id: wire.vector_id,
+                vector,
+            }
+        }
+        WIRE_OP_DELETE => WalOp::Delete { id: wire.vector_id },
+        _ => return Err(VektorError::InvalidConfig("invalid wire WalOp kind")),
+    };
+    Ok(WalRecord {
+        seq_no: wire.seq_no,
+        write_id: wire.write_id,
+        op,
+    })
+}
+
+#[must_use]
+pub fn to_wire_scored_id(hit: ScoredId) -> v1::WireScoredId {
+    v1::WireScoredId {
+        id: hit.id,
+        score: hit.score,
+    }
+}
+
+#[must_use]
+pub fn from_wire_scored_id(wire: &v1::WireScoredId) -> ScoredId {
+    ScoredId {
+        id: wire.id,
+        score: wire.score,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,5 +142,20 @@ mod tests {
                 actual: 2,
             })
         );
+    }
+
+    #[test]
+    fn wire_wal_record_round_trip() {
+        let rec = WalRecord {
+            seq_no: 7,
+            write_id: 99,
+            op: WalOp::Upsert {
+                id: 42,
+                vector: vec![1.0, 0.0, -1.0, 0.5],
+            },
+        };
+        let wire = to_wire_wal_record(&rec);
+        let parsed = from_wire_wal_record(&wire, 4).unwrap();
+        assert_eq!(parsed, rec);
     }
 }
