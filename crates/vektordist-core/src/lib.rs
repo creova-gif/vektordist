@@ -1,6 +1,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod arena;
+pub mod exact;
+
 use thiserror::Error;
 
 /// Unique identifier for a stored vector.
@@ -92,6 +95,9 @@ pub enum VektorError {
 
     #[error("vector dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
+
+    #[error("invalid vector: {0}")]
+    InvalidVector(&'static str),
 
     #[error("stale shard epoch: expected >= {current}, got {received}")]
     WrongEpoch { current: Epoch, received: Epoch },
