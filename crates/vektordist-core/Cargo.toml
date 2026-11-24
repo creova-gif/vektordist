@@ -1,0 +1,9 @@
+[package]
+name = "vektordist-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core exact search, HNSW index, flat vector arena, and CRC32 WAL primitives for VektorDist"
+
+[dependencies]
+thiserror.workspace = true

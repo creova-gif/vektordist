@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    ".",
+    "crates/vektordist-core",
+    "crates/vektordist-proto",
+    "crates/vektordist-cluster",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+vektordist-core = { path = "crates/vektordist-core" }
+vektordist-proto = { path = "crates/vektordist-proto" }
+vektordist-cluster = { path = "crates/vektordist-cluster" }
+
+[package]
+name = "vektordist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Laptop-first distributed sharded HNSW vector search engine with quorum WAL failover"
+
+[dependencies]
+clap.workspace = true
+vektordist-core.workspace = true

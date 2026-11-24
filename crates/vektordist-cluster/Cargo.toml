@@ -1,0 +1,9 @@
+[package]
+name = "vektordist-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Distributed shard replica runtime, M1 authoritative coordinator, and smart ClusterClient for VektorDist"
+
+[dependencies]
+vektordist-core.workspace = true
