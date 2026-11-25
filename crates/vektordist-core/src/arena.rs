@@ -73,6 +73,12 @@ impl VectorArena {
         self.live_count == 0
     }
 
+    /// Exact byte size of the contiguous `f32` vector payload (`slot_count * dims * 4` bytes).
+    #[must_use]
+    pub fn vector_bytes(&self) -> usize {
+        self.data.len() * std::mem::size_of::<f32>()
+    }
+
     /// Approximate heap bytes owned by the flat vector buffer, ID table, and tombstone bitset.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
@@ -201,55 +207,18 @@ pub fn normalize_l2(vector: &mut [f32]) -> bool {
     true
 }
 
-/// 4-wide unrolled dot product for LLVM NEON/AVX2 auto-vectorization.
+/// Hardware-accelerated dot product (`crate::simd::dot_product_simd`).
 #[inline]
 #[must_use]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    let mut s0 = 0.0_f32;
-    let mut s1 = 0.0_f32;
-    let mut s2 = 0.0_f32;
-    let mut s3 = 0.0_f32;
-    let (a_chunks, a_rem) = a.as_chunks::<4>();
-    let (b_chunks, b_rem) = b.as_chunks::<4>();
-    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
-        s0 += ac[0] * bc[0];
-        s1 += ac[1] * bc[1];
-        s2 += ac[2] * bc[2];
-        s3 += ac[3] * bc[3];
-    }
-    let mut rem_sum = 0.0_f32;
-    for (&x, &y) in a_rem.iter().zip(b_rem.iter()) {
-        rem_sum += x * y;
-    }
-    (s0 + s1) + (s2 + s3) + rem_sum
+    crate::simd::dot_product_simd(a, b)
 }
 
-/// 4-wide unrolled squared Euclidean distance.
+/// Hardware-accelerated squared Euclidean distance (`crate::simd::l2_squared_simd`).
 #[inline]
 #[must_use]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    let mut s0 = 0.0_f32;
-    let mut s1 = 0.0_f32;
-    let mut s2 = 0.0_f32;
-    let mut s3 = 0.0_f32;
-    let (a_chunks, a_rem) = a.as_chunks::<4>();
-    let (b_chunks, b_rem) = b.as_chunks::<4>();
-    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
-        let d0 = ac[0] - bc[0];
-        let d1 = ac[1] - bc[1];
-        let d2 = ac[2] - bc[2];
-        let d3 = ac[3] - bc[3];
-        s0 += d0 * d0;
-        s1 += d1 * d1;
-        s2 += d2 * d2;
-        s3 += d3 * d3;
-    }
-    let mut rem_sum = 0.0_f32;
-    for (&x, &y) in a_rem.iter().zip(b_rem.iter()) {
-        let d = x - y;
-        rem_sum += d * d;
-    }
-    (s0 + s1) + (s2 + s3) + rem_sum
+    crate::simd::l2_squared_simd(a, b)
 }
 
 /// Cosine similarity in `[-1.0, 1.0]`. Returns `0.0` if either vector has zero norm.

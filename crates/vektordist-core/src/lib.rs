@@ -4,6 +4,10 @@
 pub mod arena;
 pub mod exact;
 pub mod hnsw;
+pub mod hybrid;
+pub mod mmap;
+pub mod quant;
+pub mod simd;
 pub mod wal;
 
 use thiserror::Error;
