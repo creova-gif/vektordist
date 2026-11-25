@@ -5,5 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Wire protocol definitions and checked-in gRPC stubs for VektorDist"
 
+[features]
+default = []
+codegen = ["dep:tonic-build"]
+
 [dependencies]
+prost.workspace = true
+tonic.workspace = true
 vektordist-core.workspace = true
+
+[build-dependencies]
+tonic-build = { workspace = true, optional = true }

@@ -1,6 +1,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod arena;
+pub mod exact;
+pub mod hnsw;
+pub mod wal;
+
 use thiserror::Error;
 
 /// Unique identifier for a stored vector.
@@ -93,6 +98,9 @@ pub enum VektorError {
     #[error("vector dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
 
+    #[error("invalid vector: {0}")]
+    InvalidVector(&'static str),
+
     #[error("stale shard epoch: expected >= {current}, got {received}")]
     WrongEpoch { current: Epoch, received: Epoch },
 
@@ -105,6 +113,9 @@ pub enum VektorError {
 
     #[error("WAL corruption detected at byte offset {offset}")]
     WalCorruption { offset: u64 },
+
+    #[error("WAL I/O error: {0}")]
+    WalIo(String),
 }
 
 #[cfg(test)]
