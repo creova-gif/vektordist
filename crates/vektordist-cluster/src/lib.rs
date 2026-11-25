@@ -7,6 +7,7 @@
 pub mod client;
 pub mod coord;
 pub mod node;
+pub mod raft;
 
 use vektordist_core::{ClusterConfig, Epoch, NodeId, ShardId, VektorError};
 

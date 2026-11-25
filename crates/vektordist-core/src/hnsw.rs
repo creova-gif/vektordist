@@ -397,6 +397,102 @@ impl HnswIndex {
         Ok(results)
     }
 
+    /// One-stage predicate-filtered approximate top-`k` search over the HNSW graph.
+    ///
+    /// Evaluates `predicate(slot, id)` inline during layer-0 candidate traversal:
+    /// non-matching or tombstoned nodes remain traversable as routing bridges so graph
+    /// connectivity is preserved, while only matching live nodes populate the `top_results`
+    /// filter window and final returned results.
+    pub fn search_filtered_with_ef<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mut predicate: F,
+    ) -> Result<Vec<ScoredId>, VektorError>
+    where
+        F: FnMut(usize, VectorId) -> bool,
+    {
+        validate_vector(query, self.arena.dims())?;
+        if k == 0 || self.arena.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some((mut cur_ep, max_level)) = self.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        let normalized_query: Option<Vec<f32>> = match self.metric {
+            DistanceMetric::Cosine => {
+                let mut q = query.to_vec();
+                normalize_l2(&mut q);
+                Some(q)
+            }
+            DistanceMetric::L2 => None,
+        };
+        let q_slice = normalized_query.as_deref().unwrap_or(query);
+
+        for level in (1..=max_level).rev() {
+            cur_ep = self.search_layer_greedy(q_slice, cur_ep, level);
+        }
+
+        let effective_ef = ef.max(k * 4).max(32);
+        let candidates =
+            self.search_layer_filtered(q_slice, cur_ep, effective_ef, 0, &mut predicate);
+
+        let mut results = Vec::with_capacity(k);
+        for cand in candidates {
+            let Some(id) = self.arena.id_at_slot(cand.slot) else {
+                continue;
+            };
+            let raw_score = match self.metric {
+                DistanceMetric::Cosine => cand.quality,
+                DistanceMetric::L2 => -cand.quality,
+            };
+            results.push(ScoredId {
+                id,
+                score: raw_score,
+            });
+            if results.len() == k {
+                break;
+            }
+        }
+
+        // If selective predicate filtering left fewer than `k` matching results inside the
+        // explored component, scan remaining live slots that satisfy `predicate` so filtered
+        // queries never suffer post-filtering starvation when matching records exist.
+        if results.len() < k {
+            for slot in 0..self.arena.slot_count() {
+                if self.arena.is_tombstoned(slot) {
+                    continue;
+                }
+                let (Some(id), Some(vec)) =
+                    (self.arena.id_at_slot(slot), self.arena.vector_at_slot(slot))
+                else {
+                    continue;
+                };
+                if !predicate(slot, id) || results.iter().any(|r| r.id == id) {
+                    continue;
+                }
+                let quality = self.compute_quality(q_slice, vec);
+                let raw_score = match self.metric {
+                    DistanceMetric::Cosine => quality,
+                    DistanceMetric::L2 => -quality,
+                };
+                results.push(ScoredId {
+                    id,
+                    score: raw_score,
+                });
+            }
+            results.sort_by(|a, b| match self.metric {
+                DistanceMetric::Cosine => b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)),
+                DistanceMetric::L2 => a.score.total_cmp(&b.score).then_with(|| a.id.cmp(&b.id)),
+            });
+            results.truncate(k);
+        }
+
+        Ok(results)
+    }
+
     #[inline]
     fn compute_quality(&self, a: &[f32], b: &[f32]) -> f32 {
         match self.metric {
@@ -507,6 +603,116 @@ impl HnswIndex {
         }
 
         let mut out: Vec<Candidate> = top_results.into_iter().map(|w| w.0).collect();
+        out.sort_by(|a, b| b.cmp(a));
+        out
+    }
+
+    /// One-stage filtered layer search: all reachable nodes are explored as routing hops
+    /// within an expanded routing beam, while only non-tombstoned nodes matching `predicate`
+    /// enter `matched_results`.
+    fn search_layer_filtered<F>(
+        &self,
+        query: &[f32],
+        start_slot: usize,
+        ef: usize,
+        level: usize,
+        predicate: &mut F,
+    ) -> Vec<Candidate>
+    where
+        F: FnMut(usize, VectorId) -> bool,
+    {
+        let Some(start_vec) = self.arena.vector_at_slot(start_slot) else {
+            return Vec::new();
+        };
+        let total_slots = self.arena.slot_count();
+        let mut visited = vec![false; total_slots];
+        visited[start_slot] = true;
+
+        let routing_ef = ef.saturating_mul(4).max(64);
+        let start_cand = Candidate {
+            slot: start_slot,
+            quality: self.compute_quality(query, start_vec),
+        };
+
+        let mut to_explore: BinaryHeap<Candidate> = BinaryHeap::with_capacity(routing_ef + 1);
+        let mut routing_window: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(routing_ef + 1);
+        let mut matched_results: BinaryHeap<WorstFirst> = BinaryHeap::with_capacity(ef + 1);
+
+        to_explore.push(start_cand);
+        routing_window.push(WorstFirst(start_cand));
+
+        if !self.arena.is_tombstoned(start_slot) {
+            if let Some(id) = self.arena.id_at_slot(start_slot) {
+                if predicate(start_slot, id) {
+                    matched_results.push(WorstFirst(start_cand));
+                }
+            }
+        }
+
+        while let Some(curr) = to_explore.pop() {
+            let stop_by_matched = matched_results.peek().is_some_and(|&WorstFirst(worst)| {
+                matched_results.len() >= ef && curr.quality < worst.quality
+            });
+            let stop_by_routing = routing_window.peek().is_some_and(|&WorstFirst(worst)| {
+                routing_window.len() >= routing_ef && curr.quality < worst.quality
+            });
+            if stop_by_matched && stop_by_routing {
+                break;
+            }
+
+            if let Some(node_layers) = self.layers.get(curr.slot) {
+                if let Some(neighbors) = node_layers.get(level) {
+                    for &nb_slot in neighbors {
+                        if nb_slot >= total_slots || visited[nb_slot] {
+                            continue;
+                        }
+                        visited[nb_slot] = true;
+                        let Some(nb_vec) = self.arena.vector_at_slot(nb_slot) else {
+                            continue;
+                        };
+                        let q = self.compute_quality(query, nb_vec);
+                        let cand = Candidate {
+                            slot: nb_slot,
+                            quality: q,
+                        };
+
+                        let is_match = !self.arena.is_tombstoned(nb_slot)
+                            && self
+                                .arena
+                                .id_at_slot(nb_slot)
+                                .is_some_and(|id| predicate(nb_slot, id));
+
+                        if is_match {
+                            let should_keep = matched_results.len() < ef
+                                || matched_results
+                                    .peek()
+                                    .is_some_and(|&WorstFirst(worst)| q > worst.quality);
+                            if should_keep {
+                                matched_results.push(WorstFirst(cand));
+                                if matched_results.len() > ef {
+                                    matched_results.pop();
+                                }
+                            }
+                        }
+
+                        let should_explore = is_match
+                            || routing_window.len() < routing_ef
+                            || routing_window
+                                .peek()
+                                .is_some_and(|&WorstFirst(worst)| q > worst.quality);
+                        if should_explore {
+                            to_explore.push(cand);
+                            routing_window.push(WorstFirst(cand));
+                            if routing_window.len() > routing_ef {
+                                routing_window.pop();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out: Vec<Candidate> = matched_results.into_iter().map(|w| w.0).collect();
         out.sort_by(|a, b| b.cmp(a));
         out
     }
