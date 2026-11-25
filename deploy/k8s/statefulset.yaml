@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vektordist-nodes
+  labels:
+    app.kubernetes.io/name: vektordist
+    app.kubernetes.io/component: node
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: vektordist
+    app.kubernetes.io/component: node
+  ports:
+    - name: grpc
+      port: 50052
+      targetPort: 50052
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vektordist-node
+  labels:
+    app.kubernetes.io/name: vektordist
+    app.kubernetes.io/component: node
+spec:
+  serviceName: vektordist-nodes
+  replicas: 5
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vektordist
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vektordist
+        app.kubernetes.io/component: node
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        fsGroup: 65532
+      containers:
+        - name: vektordist-node
+          image: ghcr.io/justinmafie/vektordist:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/vektordist
+            - node
+            - --id
+            - "1"
+            - --listen
+            - 0.0.0.0:50052
+            - --data-dir
+            - /var/lib/vektordist/data
+            - --dimensions
+            - "768"
+            - --num-shards
+            - "16"
+            - --write-quorum
+            - "2"
+          ports:
+            - name: grpc
+              containerPort: 50052
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: wal-data
+              mountPath: /var/lib/vektordist/data
+  volumeClaimTemplates:
+    - metadata:
+        name: wal-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: premium-rwo
+        resources:
+          requests:
+            storage: 100Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vektordist-coord
+  labels:
+    app.kubernetes.io/name: vektordist
+    app.kubernetes.io/component: coord
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vektordist
+    app.kubernetes.io/component: coord
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vektordist-coord
+  labels:
+    app.kubernetes.io/name: vektordist
+    app.kubernetes.io/component: coord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vektordist
+      app.kubernetes.io/component: coord
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vektordist
+        app.kubernetes.io/component: coord
+    spec:
+      containers:
+        - name: vektordist-coord
+          image: ghcr.io/justinmafie/vektordist:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/vektordist
+            - coord
+            - --listen
+            - 0.0.0.0:50051
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi

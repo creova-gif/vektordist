@@ -4,6 +4,7 @@
 
 //! Distributed cluster control plane (`TopologyStore`) and data plane (`ShardEngine`, `ClusterClient`).
 
+pub mod backup;
 pub mod client;
 pub mod coord;
 pub mod node;
