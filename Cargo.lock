@@ -1482,6 +1482,7 @@ dependencies = [
 name = "vektordist-cluster"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "tokio",
  "tokio-stream",
  "tonic",
