@@ -8,9 +8,10 @@ pub mod backup;
 pub mod client;
 pub mod coord;
 pub mod node;
+pub mod placement;
 pub mod raft;
 
-use vektordist_core::{ClusterConfig, Epoch, NodeId, ShardId, VektorError};
+pub use vektordist_core::{ClusterConfig, Epoch, NodeId, ShardId, VektorError};
 
 /// Lifecycle state of a logical shard across failover and recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
