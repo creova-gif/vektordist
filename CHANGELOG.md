@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-26
+
+Enterprise zero-trust web console, durable `FP16` multi-collection persistence, HTTP/1.1 request-smuggling & adversarial JSON hardening, control-plane modularity, and repository governance release of **VektorDist**:
+
+### Added
+
+- **Embedded Zero-Trust Accessible Web Control Console & Responsive TUI v0.4:**
+  - Self-contained zero-dependency Web Control Console served at `GET /` and `GET /console` (`text/html; charset=utf-8`) protected by strict `Content-Security-Policy` headers, enabling live cluster topology, quorum readiness, collection, and audit inspection.
+  - Responsive `ratatui` operator TUI v0.4 featuring an interactive `[?]` keyboard shortcut help overlay, WCAG-compliant non-color status glyphs across node/shard tables, and adaptive compact viewport layouts for constrained terminal dimensions.
+- **Durable `FP16` Multi-Collection Namespaces (`collections.vdcl`):**
+  - First-class `CollectionQuantization::Fp16` (IEEE 754 `binary16` **2.0x** compression via `Fp16HnswIndex`) across `CollectionRegistry` and `/v1/collections/*`.
+  - Crash-safe atomic `b"VDCL"` persistence (`collections.vdcl.tmp` -> `fsync` -> POSIX `rename`) with trailing IEEE CRC32 verification so named collections and per-tenant (`OrgId`) vector indices survive gateway restarts with zero torn-write risk.
+- **Enterprise Architecture, SDK Validation & Repository Governance:**
+  - Authoritative system architecture reference (`docs/ARCHITECTURE.md`) with layered container, `W=2` quorum sequence, replica state-machine, binary wire-format (`VDWL`, `VDSG`, `VDCK`, `VDCL`, `VAUD`, `VDSN`), and quantization tiering matrices, plus `.env.example`, `.github/CODEOWNERS`, `.github/dependabot.yml`, and OpenAPI `3.1.0` (`v0.4.0`) updates.
+  - Hardened Python client SDK (`clients/python/vektordist_client.py`) with `VALID_METRICS` / `VALID_QUANTIZATIONS`, `fp16` (`f16` / `half`) collection normalization, and client-side `_coerce_finite_vector` rejecting `NaN`, `Inf`, `-Inf`, and empty vectors before network dispatch.
+
+### Changed & Fixed
+
+- **HTTP Request Smuggling & Adversarial JSON Hardening:**
+  - Hardened `HttpGatewayServer` against RFC 9112 desync/request-smuggling attacks by rejecting `Transfer-Encoding` and conflicting `Content-Length` headers, added string-aware JSON key scanning, rejected `NaN`/`Inf` coordinates at the wire boundary, blocked percent-decoded (`%2e%2e`) URL path traversal, added CORS preflight handling, and standardized `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Cache-Control: no-store` response headers.
+- **Control-Plane Modularity:**
+  - Extracted shard migration and rebalancing logic into `crates/vektordist-cluster/src/rebalance.rs` from `raft.rs` for cleaner separation of consensus state and placement planning.
+
 ## [0.3.0] - 2026-11-26
 
 Performance optimization, multi-collection architecture, gateway resilience, and polyglot developer ecosystem release of **VektorDist**, spanning **Milestones M16 through M19**: zero-allocation `VisitedPool` HNSW search & IEEE 754 `FP16` 2x quantization, modular gateway/telemetry/chaos architecture with Slowloris & concurrency protection plus `WriteIdDeduplicator` idempotency, named Multi-Collection `/v1/collections/*` management, OpenAPI `3.1.0` contract, zero-dependency typed Python SDK, and turnkey Docker Compose + Prometheus observability stack.
@@ -89,7 +112,8 @@ Initial open-source release of **VektorDist**, spanning **Milestones M1 through 
   - Declarative `VektorNodeConfig` (`vektordist node --config` and `VEKTORDIST_*` environment overrides), `vektordist keygen` token provisioning CLI, enriched `ratatui` cluster dashboard (`[k]` kill, `[a]` add, `[p]` pause/resume, `[r]` reset, latency sparkline, shard health summary), `vektordist chaos` automated SLA runner, and `quickstart_hybrid_agent_rag` example.
   - Full open-source governance suite (`LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, GitHub issue/PR templates, CI + multi-arch release tarballs with SHA-256 checksums).
 
-[Unreleased]: https://github.com/creova-gif/vektordist/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/creova-gif/vektordist/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/creova-gif/vektordist/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/creova-gif/vektordist/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/creova-gif/vektordist/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/creova-gif/vektordist/releases/tag/v0.1.0

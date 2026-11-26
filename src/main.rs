@@ -100,7 +100,7 @@ enum Commands {
         #[command(subcommand)]
         action: SnapshotAction,
     },
-    /// Run the HTTP/1.1 REST (`/v1/upsert`, `/v1/search`, `/v1/delete`, `/healthz`) and Prometheus `/metrics` gateway.
+    /// Run the HTTP/1.1 REST, Web Control Console (`/console`), and Prometheus `/metrics` gateway.
     Gateway {
         #[arg(long, default_value = "127.0.0.1:50051")]
         coord: String,
@@ -108,6 +108,10 @@ enum Commands {
         listen: String,
         #[arg(long)]
         master_secret: Option<String>,
+        #[arg(long)]
+        collections_dir: Option<PathBuf>,
+        #[arg(long)]
+        cors_origin: Option<String>,
     },
     /// Issue a tenant-scoped zero-trust `vdk.<key_id>.<hex_tag>` bearer token.
     Keygen {
@@ -333,12 +337,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             coord,
             listen,
             master_secret,
+            collections_dir,
+            cors_origin,
         } => {
             let client = ClusterClient::connect(&coord).await?;
             let secret_opt = master_secret
                 .or_else(|| std::env::var("VEKTORDIST_MASTER_SECRET").ok())
                 .filter(|s| !s.trim().is_empty());
-            let gw = if let Some(secret_str) = secret_opt {
+            let mut gw = if let Some(secret_str) = secret_opt {
                 let gate = SecurityGate::new(
                     derive_master_secret(&secret_str),
                     TenantQuotaPolicy::default(),
@@ -347,9 +353,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 HttpGatewayServer::new(client)
             };
+            if let Some(col_dir) = collections_dir {
+                gw = gw.with_collections_dir(col_dir)?;
+            }
+            if let Some(origin) = cors_origin {
+                gw = gw.with_cors_origin(origin);
+            }
             let (bound_addr, handle) = spawn_http_gateway(&listen, gw).await?;
             println!(
-                "vektordist HTTP/1.1 REST & Prometheus gateway listening on http://{bound_addr} (upstream coord={coord})"
+                "vektordist HTTP/1.1 REST, Web Console (http://{bound_addr}/console) & Prometheus gateway listening on http://{bound_addr} (upstream coord={coord})"
             );
             let _ = handle.await;
         }

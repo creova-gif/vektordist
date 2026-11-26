@@ -315,10 +315,12 @@ impl TraceSpan {
 pub const fn openapi_spec_json() -> &'static str {
     concat!(
         "{\"openapi\":\"3.1.0\",",
-        "\"info\":{\"title\":\"VektorDist Zero-Trust Gateway API\",\"version\":\"0.2.0\",",
+        "\"info\":{\"title\":\"VektorDist Zero-Trust Gateway API\",\"version\":\"0.4.0\",",
         "\"description\":\"Distributed quorum-durable vector database and multi-collection namespace gateway.\"},",
         "\"components\":{\"securitySchemes\":{\"BearerAuth\":{\"type\":\"http\",\"scheme\":\"bearer\"}}},",
         "\"paths\":{",
+        "\"/\":{\"get\":{\"summary\":\"Interactive Web Control Console\",\"responses\":{\"200\":{\"description\":\"Interactive Web Control Console\"}}}},",
+        "\"/console\":{\"get\":{\"summary\":\"Interactive Web Control Console\",\"responses\":{\"200\":{\"description\":\"Interactive Web Control Console\"}}}},",
         "\"/healthz\":{\"get\":{\"summary\":\"Kubernetes liveness probe\",\"responses\":{\"200\":{\"description\":\"Alive\"}}}},",
         "\"/readyz\":{\"get\":{\"summary\":\"Kubernetes quorum and drain readiness probe\",\"responses\":{\"200\":{\"description\":\"Ready\"},\"503\":{\"description\":\"Draining or under quorum\"}}}},",
         "\"/metrics\":{\"get\":{\"summary\":\"Prometheus 0.0.4 exposition endpoint\",\"responses\":{\"200\":{\"description\":\"Prometheus text metrics\"}}}},",
@@ -379,12 +381,27 @@ pub(crate) fn build_http_response_with_headers(
     extra_headers: &[(&str, &str)],
     body: &str,
 ) -> String {
+    const DEFAULT_SECURITY_HEADERS: [(&str, &str); 4] = [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        ("cache-control", "no-store"),
+    ];
+
     let mut out = format!(
         "HTTP/1.1 {status_code} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nx-trace-id: {}\r\ntraceparent: {}\r\nx-latency-ms: {latency_ms:.3}\r\n",
         body.len(),
         span.trace_id,
         span.to_traceparent(),
     );
+    for &(sec_k, sec_v) in &DEFAULT_SECURITY_HEADERS {
+        let already_set = extra_headers
+            .iter()
+            .any(|&(k, _)| k.eq_ignore_ascii_case(sec_k));
+        if !already_set {
+            let _ = write!(out, "{sec_k}: {sec_v}\r\n");
+        }
+    }
     for &(k, v) in extra_headers {
         let _ = write!(out, "{k}: {v}\r\n");
     }
@@ -435,17 +452,82 @@ pub(crate) fn escape_json_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Locate the JSON value slice immediately following `"<key>":` while scanning strictly outside
+/// JSON string values so attacker-controlled string payloads (e.g. `{"note": "\"id\": 999", "id": 42}`)
+/// can never shadow real object keys.
 fn find_json_key_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let pattern = format!("\"{key}\"");
-    let mut remainder = json;
-    while let Some(idx) = remainder.find(&pattern) {
-        let after_key = remainder.get(idx + pattern.len()..)?;
-        if let Some(after_colon) = after_key.trim_start().strip_prefix(':') {
-            return Some(after_colon.trim_start());
+    let bytes = json.as_bytes();
+    let mut idx = 0_usize;
+
+    while idx < bytes.len() {
+        if bytes[idx] != b'"' {
+            idx += 1;
+            continue;
         }
-        remainder = after_key;
+
+        // Parse JSON string literal starting at `idx`, decoding escapes if needed to compare with `key`.
+        let str_start = idx + 1;
+        let mut cursor = str_start;
+        let mut escaped = false;
+        let mut has_escapes = false;
+        let mut str_end_opt: Option<usize> = None;
+
+        while cursor < bytes.len() {
+            let b = bytes[cursor];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+                has_escapes = true;
+            } else if b == b'"' {
+                str_end_opt = Some(cursor);
+                break;
+            }
+            cursor += 1;
+        }
+
+        let str_end = str_end_opt?;
+        let after_quote = json.get(str_end + 1..)?;
+        let trimmed_after = after_quote.trim_start();
+
+        // A JSON string is an object key iff the next non-whitespace token is `:`.
+        if let Some(after_colon) = trimmed_after.strip_prefix(':') {
+            let raw_key_slice = json.get(str_start..str_end)?;
+            let matches_key = if !has_escapes {
+                raw_key_slice == key
+            } else {
+                unescape_json_simple(raw_key_slice).as_deref() == Some(key)
+            };
+            if matches_key {
+                return Some(after_colon.trim_start());
+            }
+        }
+
+        // Advance past the closing quote of this string (whether it was a non-matching key or a string value!).
+        idx = str_end + 1;
     }
+
     None
+}
+
+fn unescape_json_simple(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escaped {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 pub(crate) fn extract_json_str(json: &str, key: &str) -> Option<String> {
@@ -479,14 +561,22 @@ pub(crate) fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
 pub(crate) fn extract_json_f32_array(json: &str, key: &str) -> Option<Vec<f32>> {
     let after_colon = find_json_key_value(json, key)?;
     let after_open = after_colon.strip_prefix('[')?;
-    let close_idx = after_open.find(']')?;
+    let close_idx = find_matching_delimiter(after_open, b'[', b']')?;
     let inner = after_open.get(..close_idx)?.trim();
     if inner.is_empty() {
         return Some(Vec::new());
     }
     let mut out = Vec::new();
     for item in inner.split(',') {
-        let val = item.trim().parse::<f32>().ok()?;
+        let token = item.trim();
+        if token.is_empty() {
+            return None;
+        }
+        // Reject explicit non-JSON float tokens like NaN/inf/Infinity as well as overflow (e.g. 1e999 -> inf).
+        let val = token.parse::<f32>().ok()?;
+        if !val.is_finite() {
+            return None;
+        }
         out.push(val);
     }
     Some(out)

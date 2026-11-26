@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from clients.python.vektordist_client import (
+    VALID_METRICS,
+    VALID_QUANTIZATIONS,
     AuthenticationError,
     AuthorizationError,
     PayloadTooLargeError,
@@ -363,7 +365,12 @@ class VektorDistClientTest(unittest.TestCase):
         self.httpd.server_close()
         self.server_thread.join(timeout=2.0)
 
-    def _assert_request_headers(self, req: RecordedRequest, expected_token: str, expected_org: str) -> None:
+    def _assert_request_headers(
+        self,
+        req: RecordedRequest,
+        expected_token: str,
+        expected_org: str,
+    ) -> None:
         self.assertEqual(req.headers.get("authorization"), f"Bearer {expected_token}")
         self.assertEqual(req.headers.get("x-org-id"), expected_org)
         tp = req.headers.get("traceparent", "")
@@ -453,6 +460,76 @@ class VektorDistClientTest(unittest.TestCase):
         with self.state.lock:
             last_req = self.state.requests[-1]
         self.assertEqual(last_req.headers.get("traceparent"), explicit_tp)
+
+    def test_fp16_collection_normalization_and_pre_network_validation(self) -> None:
+        self.assertEqual(VALID_METRICS, ("cosine", "l2"))
+        self.assertEqual(VALID_QUANTIZATIONS, ("f32", "fp16", "sq8", "bq"))
+
+        client = VektorDistClient(
+            base_url=self.base_url,
+            bearer_token="vdk.key-fp16.valid",
+        )
+
+        # Lowercase, uppercase, and half-precision aliases normalize to canonical `"fp16"`.
+        for idx, quant_variant in enumerate(("fp16", "FP16", "f16", "half")):
+            res = client.create_collection(
+                f"col_{idx}",
+                dimensions=768,
+                metric="COSINE" if idx % 2 == 0 else "L2",
+                quantization=quant_variant,
+            )
+            self.assertEqual(res["collection"]["quantization"], "fp16")
+
+        with self.state.lock:
+            self.assertEqual(len(self.state.requests), 4)
+            for req in self.state.requests:
+                assert req.body is not None
+                self.assertEqual(req.body["quantization"], "fp16")
+                self.assertIn(req.body["metric"], VALID_METRICS)
+            self.state.requests.clear()
+
+        # Invalid metric, quantization, and non-positive dimensions fail before any network I/O.
+        with self.assertRaises(ValueError):
+            client.create_collection("bad_metric", dimensions=16, metric="manhattan")
+        with self.assertRaises(ValueError):
+            client.create_collection("bad_quant", dimensions=16, quantization="int4")
+        with self.assertRaises(ValueError):
+            client.create_collection("zero_dims", dimensions=0)
+        with self.assertRaises(ValueError):
+            client.create_collection("neg_dims", dimensions=-8)
+
+        with self.state.lock:
+            self.assertEqual(len(self.state.requests), 0)
+
+    def test_non_finite_and_empty_vectors_rejected_before_network_io(self) -> None:
+        client = VektorDistClient(
+            base_url=self.base_url,
+            bearer_token="vdk.key-finite.guard",
+        )
+
+        non_finite_cases: list[list[float]] = [
+            [0.1, float("nan"), 0.3],
+            [float("inf"), 0.2, 0.3],
+            [0.1, float("-inf"), 0.3],
+            [],
+        ]
+        for bad_vec in non_finite_cases:
+            with self.subTest(bad_vec=bad_vec):
+                with self.assertRaises(ValueError):
+                    client.upsert(1, bad_vec)
+                with self.assertRaises(ValueError):
+                    client.search(bad_vec, top_k=5)
+                with self.assertRaises(ValueError):
+                    client.upsert_batch([(1, [0.1, 0.2, 0.3]), (2, bad_vec)])
+                with self.assertRaises(ValueError):
+                    client.upsert_batch([{"id": 3, "vector": bad_vec}])
+                with self.assertRaises(ValueError):
+                    client.collection_upsert("docs_fp16", 1, bad_vec)
+                with self.assertRaises(ValueError):
+                    client.collection_search("docs_fp16", bad_vec, top_k=5)
+
+        with self.state.lock:
+            self.assertEqual(len(self.state.requests), 0)
 
     def test_retry_on_429_succeeds_on_second_attempt_and_raises_when_exhausted(self) -> None:
         client = VektorDistClient(

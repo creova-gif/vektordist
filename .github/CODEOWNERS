@@ -1,0 +1,34 @@
+# ==============================================================================
+# VektorDist Repository Ownership & Mandatory Review Boundaries
+# ==============================================================================
+# Each path pattern maps architectural subsystems to designated maintainers for
+# automated pull-request review routing and branch-protection enforcement.
+
+# Default fallback owner across root CLI, workspace manifests, and documentation
+*                               @creova-gif
+
+# Storage Engine, SIMD Kernels, Multi-Tier Quantization (FP16/SQ8/PQ/BQ) & CRC32 WAL
+# Invariants: zero `.unwrap()`/`.expect()`, 8/64-byte alignment safety, bit-rot fail-closed
+/crates/vektordist-core/        @creova-gif
+
+# Consensus (Raft), Epoch Fencing, Rebalancing, Zero-Trust SecurityGate & HTTP Gateway
+# Invariants: W=2 of RF=3 quorum durability, constant-time MAC auth, request-smuggling guards
+/crates/vektordist-cluster/     @creova-gif
+
+# Wire Protocol Schemas & Checked-In Tonic/Prost gRPC Stubs
+# Invariants: backward-compatible protobuf field numbering and epoch propagation
+/crates/vektordist-proto/       @creova-gif
+
+# Official Client SDKs (Zero-Dependency Strictly Typed Python Client)
+# Invariants: `ruff check` + `mypy --strict` cleanliness and finite-vector validation
+/clients/python/                @creova-gif
+
+# Production Infrastructure, Distroless Containers, Kubernetes StatefulSets & Terraform
+# Invariants: non-root `65532:65532` securityContext, PodDisruptionBudget, pd-ssd durability
+/deploy/                        @creova-gif
+
+# CI/CD Workflows, Release Pipelines, Dependabot & Repository Governance
+/.github/                       @creova-gif
+
+# Architecture Decision Records (ADRs) & System Design Governance
+/docs/adr/                      @creova-gif

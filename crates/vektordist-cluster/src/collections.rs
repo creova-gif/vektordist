@@ -1,14 +1,18 @@
-//! Milestone 18: Multi-collection namespace management (`CollectionRegistry`) with independent
-//! dimensionality, distance metrics (`Cosine`, `L2`), quantization profiles (`F32`, `Sq8`, `Bq`),
-//! and strict per-vector `OrgId` tenant isolation.
+//! Multi-collection namespace management (`CollectionRegistry`) with independent dimensionality,
+//! distance metrics (`Cosine`, `L2`), quantization profiles (`F32`, `Fp16`, `Sq8`, `Bq`), strict
+//! per-vector `OrgId` tenant isolation, and atomic CRC32-verified durable persistence (`b"VDCL"`).
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
-use std::sync::{Arc, RwLock};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Instant;
 
 use vektordist_core::arena::{validate_vector, VectorArena};
 use vektordist_core::exact::ScoredId;
+use vektordist_core::fp16::Fp16HnswIndex;
 use vektordist_core::hnsw::{HnswIndex, HnswParams};
 use vektordist_core::pq_bq::BqIndex;
 use vektordist_core::quant::{Sq8HnswIndex, Sq8Quantizer};
@@ -26,12 +30,26 @@ pub const MAX_COLLECTION_NAME_LEN: usize = 128;
 /// Maximum permitted vector dimensionality for a single collection.
 pub const MAX_COLLECTION_DIMENSIONS: usize = 65_536;
 
+/// 4-byte magic header identifying a durable VektorDist collection registry snapshot (`b"VDCL"`).
+pub const COLLECTIONS_SNAPSHOT_MAGIC: [u8; 4] = *b"VDCL";
+
+/// Binary format version for `collections.vdcl`.
+pub const COLLECTIONS_SNAPSHOT_VERSION: u32 = 1;
+
+/// Canonical snapshot filename inside a collection persistence directory.
+pub const COLLECTIONS_SNAPSHOT_FILENAME: &str = "collections.vdcl";
+
+const HEADER_LEN: usize = 12; // 4 magic + 4 version + 4 collection_count
+const CRC_LEN: usize = 4;
+
 /// Storage and search quantization profile configured per collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CollectionQuantization {
     /// Full-precision 32-bit IEEE 754 floating-point HNSW index (`HnswIndex`).
     #[default]
     F32,
+    /// Half-precision 16-bit IEEE 754 `binary16` HNSW index (`Fp16HnswIndex`, 2x payload compression).
+    Fp16,
     /// 8-bit uniform scalar quantized HNSW index (`Sq8HnswIndex`, 4x payload compression).
     Sq8,
     /// 1-bit binary quantized `XOR + POPCNT` index with exact reranking (`BqIndex`, 32x code compression).
@@ -39,25 +57,46 @@ pub enum CollectionQuantization {
 }
 
 impl CollectionQuantization {
-    /// Canonical lowercase JSON string representation (`"f32"`, `"sq8"`, `"bq"`).
+    /// Canonical lowercase JSON string representation (`"f32"`, `"fp16"`, `"sq8"`, `"bq"`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::F32 => "f32",
+            Self::Fp16 => "fp16",
             Self::Sq8 => "sq8",
             Self::Bq => "bq",
         }
     }
 
-    /// Parse a case-insensitive quantization identifier (`"f32"`, `"sq8"`, `"bq"`).
+    /// Parse a case-insensitive quantization identifier (`"f32"`, `"fp16"`/`"f16"`/`"half"`, `"sq8"`, `"bq"`).
     pub fn parse(raw: &str) -> Result<Self, CollectionError> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "f32" => Ok(Self::F32),
+            "fp16" | "f16" | "half" => Ok(Self::Fp16),
             "sq8" => Ok(Self::Sq8),
             "bq" => Ok(Self::Bq),
             _ => Err(CollectionError::InvalidSpec(format!(
-                "unsupported quantization '{raw}': expected 'f32', 'sq8', or 'bq'"
+                "unsupported quantization '{raw}': quantization must be 'f32', 'fp16', 'sq8', or 'bq'"
             ))),
+        }
+    }
+
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::F32 => 0,
+            Self::Fp16 => 1,
+            Self::Sq8 => 2,
+            Self::Bq => 3,
+        }
+    }
+
+    fn from_u8(code: u8, offset: u64) -> Result<Self, VektorError> {
+        match code {
+            0 => Ok(Self::F32),
+            1 => Ok(Self::Fp16),
+            2 => Ok(Self::Sq8),
+            3 => Ok(Self::Bq),
+            _ => Err(VektorError::WalCorruption { offset }),
         }
     }
 }
@@ -88,6 +127,21 @@ pub fn parse_distance_metric(raw: &str) -> Result<DistanceMetric, CollectionErro
     }
 }
 
+const fn metric_to_u8(metric: DistanceMetric) -> u8 {
+    match metric {
+        DistanceMetric::Cosine => 0,
+        DistanceMetric::L2 => 1,
+    }
+}
+
+fn u8_to_metric(code: u8, offset: u64) -> Result<DistanceMetric, VektorError> {
+    match code {
+        0 => Ok(DistanceMetric::Cosine),
+        1 => Ok(DistanceMetric::L2),
+        _ => Err(VektorError::WalCorruption { offset }),
+    }
+}
+
 /// Errors produced by [`CollectionRegistry`] lifecycle and data-plane operations.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CollectionError {
@@ -97,7 +151,7 @@ pub enum CollectionError {
     NotFound(String),
     /// Invalid collection name, dimensionality, metric, or quantization (`400 Bad Request`).
     InvalidSpec(String),
-    /// Underlying vector validation or index error (`400 Bad Request`).
+    /// Underlying vector validation, persistence, or index error (`400 Bad Request` / `500`).
     Core(VektorError),
 }
 
@@ -188,6 +242,7 @@ impl CollectionInfo {
 
 enum TenantCollectionIndex {
     F32(HnswIndex),
+    Fp16(Fp16HnswIndex),
     Sq8(Sq8HnswIndex),
     Bq { bq: BqIndex, rerank: VectorArena },
 }
@@ -197,6 +252,11 @@ impl TenantCollectionIndex {
         let params = HnswParams::default();
         match spec.quantization {
             CollectionQuantization::F32 => Ok(Self::F32(HnswIndex::new(
+                spec.dimensions,
+                spec.metric,
+                params,
+            )?)),
+            CollectionQuantization::Fp16 => Ok(Self::Fp16(Fp16HnswIndex::new(
                 spec.dimensions,
                 spec.metric,
                 params,
@@ -224,6 +284,9 @@ impl TenantCollectionIndex {
             Self::F32(idx) => {
                 idx.upsert(id, vector)?;
             }
+            Self::Fp16(idx) => {
+                idx.upsert(id, vector)?;
+            }
             Self::Sq8(idx) => {
                 idx.upsert(id, vector)?;
             }
@@ -245,6 +308,7 @@ impl TenantCollectionIndex {
         let ef = ef_search.max(k);
         match self {
             Self::F32(idx) => Ok(idx.search_with_ef(query, k, ef)?),
+            Self::Fp16(idx) => Ok(idx.search_with_ef(query, k, ef)?),
             Self::Sq8(idx) => Ok(idx.search_with_ef(query, k, ef)?),
             Self::Bq { bq, rerank } => {
                 let oversample = (ef / k).max(4);
@@ -256,6 +320,7 @@ impl TenantCollectionIndex {
     fn delete(&mut self, id: VectorId) -> bool {
         match self {
             Self::F32(idx) => idx.delete(id),
+            Self::Fp16(idx) => idx.delete(id),
             Self::Sq8(idx) => idx.delete(id),
             Self::Bq { bq, rerank } => {
                 let deleted_bq = bq.delete(id);
@@ -268,6 +333,7 @@ impl TenantCollectionIndex {
     fn live_vectors(&self) -> usize {
         match self {
             Self::F32(idx) => idx.len(),
+            Self::Fp16(idx) => idx.len(),
             Self::Sq8(idx) => idx.len(),
             Self::Bq { bq, .. } => bq.len(),
         }
@@ -276,6 +342,7 @@ impl TenantCollectionIndex {
     fn memory_bytes(&self) -> usize {
         match self {
             Self::F32(idx) => idx.memory_bytes(),
+            Self::Fp16(idx) => idx.memory_bytes(),
             Self::Sq8(idx) => idx.memory_bytes(),
             Self::Bq { bq, rerank } => bq.arena().memory_bytes() + rerank.memory_bytes(),
         }
@@ -284,14 +351,18 @@ impl TenantCollectionIndex {
 
 struct CollectionInstance {
     spec: CollectionSpec,
+    next_seq: u64,
     tenants: BTreeMap<OrgId, TenantCollectionIndex>,
+    canonical_vectors: BTreeMap<(OrgId, VectorId), Vec<f32>>,
 }
 
 impl CollectionInstance {
     fn new(spec: CollectionSpec) -> Self {
         Self {
             spec,
+            next_seq: 1,
             tenants: BTreeMap::new(),
+            canonical_vectors: BTreeMap::new(),
         }
     }
 
@@ -314,17 +385,276 @@ impl CollectionInstance {
 }
 
 /// Thread-safe multi-collection namespace registry enforcing independent per-collection vector
-/// schemas (`dimensions`, `metric`, `quantization`) and strict per-tenant `OrgId` isolation.
+/// schemas (`dimensions`, `metric`, `quantization`), strict per-tenant `OrgId` isolation, and
+/// optional atomic CRC32-verified crash-safe persistence (`collections.vdcl`).
 #[derive(Default)]
 pub struct CollectionRegistry {
     collections: RwLock<BTreeMap<String, Arc<RwLock<CollectionInstance>>>>,
+    persist_dir: Option<PathBuf>,
+    persist_lock: Mutex<()>,
 }
 
 impl CollectionRegistry {
-    /// Construct an empty `CollectionRegistry`.
+    /// Construct an empty in-memory `CollectionRegistry`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct or recover a `CollectionRegistry` backed by crash-safe persistence in `dir`.
+    ///
+    /// Automatically loads `<dir>/collections.vdcl` if present, and atomically persists every
+    /// subsequent `create_collection`, `drop_collection`, `upsert`, and `delete` operation.
+    pub fn with_persistence_dir(dir: impl Into<PathBuf>) -> Result<Self, VektorError> {
+        let dir_path = dir.into();
+        std::fs::create_dir_all(&dir_path).map_err(|e| VektorError::WalIo(e.to_string()))?;
+        let mut loaded = Self::load_from_dir(&dir_path)?;
+        loaded.persist_dir = Some(dir_path);
+        Ok(loaded)
+    }
+
+    /// Atomically snapshot all collection schemas and live tenant vectors to `<dir>/collections.vdcl`
+    /// using `.vdcl.tmp` -> `sync_all()` -> `std::fs::rename` with a trailing IEEE CRC32 checksum.
+    pub fn save_to_dir(&self, dir: &Path) -> Result<(), VektorError> {
+        std::fs::create_dir_all(dir).map_err(|e| VektorError::WalIo(e.to_string()))?;
+
+        let payload = self.encode_snapshot_bytes()?;
+        let final_path = dir.join(COLLECTIONS_SNAPSHOT_FILENAME);
+        let tmp_path = dir.join("collections.vdcl.tmp");
+
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(|e| VektorError::WalIo(e.to_string()))?;
+            file.write_all(&payload)
+                .map_err(|e| VektorError::WalIo(e.to_string()))?;
+            file.sync_all()
+                .map_err(|e| VektorError::WalIo(e.to_string()))?;
+        }
+
+        std::fs::rename(&tmp_path, &final_path).map_err(|e| VektorError::WalIo(e.to_string()))?;
+        sync_dir_best_effort(dir);
+        Ok(())
+    }
+
+    /// Recover a `CollectionRegistry` from `<dir>/collections.vdcl`, verifying the `b"VDCL"` magic,
+    /// format version, bounds, and trailing IEEE CRC32 checksum before rebuilding all tenant
+    /// `F32`, `Fp16`, `Sq8`, and `Bq` HNSW indexes.
+    ///
+    /// Returns `Ok(Self::new())` if `<dir>/collections.vdcl` does not exist yet.
+    pub fn load_from_dir(dir: &Path) -> Result<Self, VektorError> {
+        let final_path = dir.join(COLLECTIONS_SNAPSHOT_FILENAME);
+        if !final_path.exists() {
+            return Ok(Self::new());
+        }
+        let bytes = std::fs::read(&final_path).map_err(|e| VektorError::WalIo(e.to_string()))?;
+        Self::decode_snapshot_bytes(&bytes)
+    }
+
+    fn auto_persist_if_configured(&self) -> Result<(), CollectionError> {
+        let Some(dir) = &self.persist_dir else {
+            return Ok(());
+        };
+        let _guard = self
+            .persist_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.save_to_dir(dir)?;
+        Ok(())
+    }
+
+    fn encode_snapshot_bytes(&self) -> Result<Vec<u8>, VektorError> {
+        let col_arcs: Vec<Arc<RwLock<CollectionInstance>>> = {
+            let guard = self
+                .collections
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard.values().cloned().collect()
+        };
+
+        let col_count_u32 = u32::try_from(col_arcs.len())
+            .map_err(|_| VektorError::InvalidConfig("collection count overflows u32"))?;
+
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(&COLLECTIONS_SNAPSHOT_MAGIC);
+        buf.extend_from_slice(&COLLECTIONS_SNAPSHOT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&col_count_u32.to_le_bytes());
+
+        for col_arc in col_arcs {
+            let col = col_arc.read().unwrap_or_else(PoisonError::into_inner);
+            let name_bytes = col.spec.name.as_bytes();
+            let name_len = u32::try_from(name_bytes.len())
+                .map_err(|_| VektorError::InvalidConfig("collection name overflows u32"))?;
+            let dims_u32 = u32::try_from(col.spec.dimensions)
+                .map_err(|_| VektorError::InvalidConfig("collection dimensions overflow u32"))?;
+            let entry_count = col.canonical_vectors.len() as u64;
+
+            buf.extend_from_slice(&name_len.to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&dims_u32.to_le_bytes());
+            buf.push(metric_to_u8(col.spec.metric));
+            buf.push(col.spec.quantization.to_u8());
+            buf.extend_from_slice(&col.next_seq.to_le_bytes());
+            buf.extend_from_slice(&entry_count.to_le_bytes());
+
+            for ((org_id, vec_id), coords) in &col.canonical_vectors {
+                let org_bytes = org_id.as_str().as_bytes();
+                let org_len = u32::try_from(org_bytes.len())
+                    .map_err(|_| VektorError::InvalidConfig("org_id length overflows u32"))?;
+                buf.extend_from_slice(&org_len.to_le_bytes());
+                buf.extend_from_slice(org_bytes);
+                buf.extend_from_slice(&vec_id.to_le_bytes());
+                for &val in coords {
+                    buf.extend_from_slice(&val.to_le_bytes());
+                }
+            }
+        }
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&buf);
+        let crc = hasher.finalize();
+        buf.extend_from_slice(&crc.to_le_bytes());
+        Ok(buf)
+    }
+
+    fn decode_snapshot_bytes(bytes: &[u8]) -> Result<Self, VektorError> {
+        if bytes.len() < HEADER_LEN + CRC_LEN {
+            return Err(VektorError::WalCorruption { offset: 0 });
+        }
+        if bytes[0..4] != COLLECTIONS_SNAPSHOT_MAGIC {
+            return Err(VektorError::WalCorruption { offset: 0 });
+        }
+        let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if version != COLLECTIONS_SNAPSHOT_VERSION {
+            return Err(VektorError::WalCorruption { offset: 4 });
+        }
+
+        let crc_offset = bytes.len() - CRC_LEN;
+        let expected_crc = u32::from_le_bytes([
+            bytes[crc_offset],
+            bytes[crc_offset + 1],
+            bytes[crc_offset + 2],
+            bytes[crc_offset + 3],
+        ]);
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&bytes[..crc_offset]);
+        let actual_crc = hasher.finalize();
+        if actual_crc != expected_crc {
+            return Err(VektorError::WalCorruption {
+                offset: crc_offset as u64,
+            });
+        }
+
+        let payload = &bytes[..crc_offset];
+        let col_count =
+            u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+        let mut cursor = HEADER_LEN;
+        let mut restored_map: BTreeMap<String, Arc<RwLock<CollectionInstance>>> = BTreeMap::new();
+
+        for _ in 0..col_count {
+            let name_len = read_u32_le(payload, &mut cursor)? as usize;
+            if name_len == 0 || name_len > MAX_COLLECTION_NAME_LEN {
+                return Err(VektorError::WalCorruption {
+                    offset: cursor as u64,
+                });
+            }
+            let name_bytes = read_slice(payload, &mut cursor, name_len)?;
+            let name = std::str::from_utf8(name_bytes)
+                .map_err(|_| VektorError::WalCorruption {
+                    offset: cursor as u64,
+                })?
+                .to_string();
+
+            let dimensions = read_u32_le(payload, &mut cursor)? as usize;
+            let metric_code = read_u8(payload, &mut cursor)?;
+            let metric = u8_to_metric(metric_code, (cursor - 1) as u64)?;
+            let quant_code = read_u8(payload, &mut cursor)?;
+            let quantization = CollectionQuantization::from_u8(quant_code, (cursor - 1) as u64)?;
+            let next_seq = read_u64_le(payload, &mut cursor)?;
+            let entry_count =
+                usize::try_from(read_u64_le(payload, &mut cursor)?).map_err(|_| {
+                    VektorError::WalCorruption {
+                        offset: cursor as u64,
+                    }
+                })?;
+
+            let spec = CollectionSpec::new(name.clone(), dimensions, metric, quantization);
+            spec.validate().map_err(|_| VektorError::WalCorruption {
+                offset: cursor as u64,
+            })?;
+            if restored_map.contains_key(&name) {
+                return Err(VektorError::WalCorruption {
+                    offset: cursor as u64,
+                });
+            }
+
+            let mut instance = CollectionInstance::new(spec);
+            instance.next_seq = next_seq.max(1);
+
+            for _ in 0..entry_count {
+                let org_len = read_u32_le(payload, &mut cursor)? as usize;
+                let org_bytes = read_slice(payload, &mut cursor, org_len)?;
+                let org_str =
+                    std::str::from_utf8(org_bytes).map_err(|_| VektorError::WalCorruption {
+                        offset: cursor as u64,
+                    })?;
+                let org_id = OrgId::new(org_str).map_err(|_| VektorError::WalCorruption {
+                    offset: cursor as u64,
+                })?;
+                let vec_id = read_u64_le(payload, &mut cursor)?;
+
+                let byte_len = dimensions
+                    .checked_mul(4)
+                    .ok_or(VektorError::WalCorruption {
+                        offset: cursor as u64,
+                    })?;
+                let coord_bytes = read_slice(payload, &mut cursor, byte_len)?;
+                let mut coords = Vec::with_capacity(dimensions);
+                for &chunk in coord_bytes.as_chunks::<4>().0 {
+                    let v = f32::from_le_bytes(chunk);
+                    if !v.is_finite() {
+                        return Err(VektorError::WalCorruption {
+                            offset: cursor as u64,
+                        });
+                    }
+                    coords.push(v);
+                }
+
+                if !instance.tenants.contains_key(&org_id) {
+                    let created = TenantCollectionIndex::new(&instance.spec).map_err(|_| {
+                        VektorError::WalCorruption {
+                            offset: cursor as u64,
+                        }
+                    })?;
+                    instance.tenants.insert(org_id.clone(), created);
+                }
+                if let Some(tenant_idx) = instance.tenants.get_mut(&org_id) {
+                    tenant_idx
+                        .upsert(vec_id, &coords)
+                        .map_err(|_| VektorError::WalCorruption {
+                            offset: cursor as u64,
+                        })?;
+                }
+                instance.canonical_vectors.insert((org_id, vec_id), coords);
+            }
+
+            restored_map.insert(name, Arc::new(RwLock::new(instance)));
+        }
+
+        if cursor != payload.len() {
+            return Err(VektorError::WalCorruption {
+                offset: cursor as u64,
+            });
+        }
+
+        Ok(Self {
+            collections: RwLock::new(restored_map),
+            persist_dir: None,
+            persist_lock: Mutex::new(()),
+        })
     }
 
     /// Create and register a new collection from `spec`.
@@ -333,16 +663,20 @@ impl CollectionRegistry {
         spec: CollectionSpec,
     ) -> Result<CollectionInfo, CollectionError> {
         spec.validate()?;
-        let mut guard = self
-            .collections
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if guard.contains_key(&spec.name) {
-            return Err(CollectionError::AlreadyExists(spec.name));
-        }
-        let instance = CollectionInstance::new(spec.clone());
-        let info = instance.info();
-        guard.insert(spec.name, Arc::new(RwLock::new(instance)));
+        let info = {
+            let mut guard = self
+                .collections
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if guard.contains_key(&spec.name) {
+                return Err(CollectionError::AlreadyExists(spec.name));
+            }
+            let instance = CollectionInstance::new(spec.clone());
+            let info = instance.info();
+            guard.insert(spec.name, Arc::new(RwLock::new(instance)));
+            info
+        };
+        self.auto_persist_if_configured()?;
         Ok(info)
     }
 
@@ -352,12 +686,10 @@ impl CollectionRegistry {
         let guard = self
             .collections
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         let mut out = Vec::with_capacity(guard.len());
         for col_arc in guard.values() {
-            let col = col_arc
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let col = col_arc.read().unwrap_or_else(PoisonError::into_inner);
             out.push(col.info());
         }
         out
@@ -369,16 +701,18 @@ impl CollectionRegistry {
             let mut guard = self
                 .collections
                 .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(PoisonError::into_inner);
             guard.remove(name)
         };
         let Some(col_arc) = removed else {
             return Err(CollectionError::NotFound(name.to_string()));
         };
-        let col = col_arc
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(col.info())
+        let info = {
+            let col = col_arc.read().unwrap_or_else(PoisonError::into_inner);
+            col.info()
+        };
+        self.auto_persist_if_configured()?;
+        Ok(info)
     }
 
     /// Upsert `(id, vector)` into `collection` strictly scoped to `org_id`.
@@ -390,17 +724,21 @@ impl CollectionRegistry {
         vector: &[f32],
     ) -> Result<(), CollectionError> {
         let col_arc = self.lookup(collection)?;
-        let mut col = col_arc
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_vector(vector, col.spec.dimensions)?;
-        if !col.tenants.contains_key(org_id) {
-            let created = TenantCollectionIndex::new(&col.spec)?;
-            col.tenants.insert(org_id.clone(), created);
+        {
+            let mut col = col_arc.write().unwrap_or_else(PoisonError::into_inner);
+            validate_vector(vector, col.spec.dimensions)?;
+            if !col.tenants.contains_key(org_id) {
+                let created = TenantCollectionIndex::new(&col.spec)?;
+                col.tenants.insert(org_id.clone(), created);
+            }
+            if let Some(tenant_idx) = col.tenants.get_mut(org_id) {
+                tenant_idx.upsert(id, vector)?;
+            }
+            col.canonical_vectors
+                .insert((org_id.clone(), id), vector.to_vec());
+            col.next_seq = col.next_seq.saturating_add(1);
         }
-        if let Some(tenant_idx) = col.tenants.get_mut(org_id) {
-            tenant_idx.upsert(id, vector)?;
-        }
+        self.auto_persist_if_configured()?;
         Ok(())
     }
 
@@ -414,9 +752,7 @@ impl CollectionRegistry {
         ef_search: usize,
     ) -> Result<Vec<ScoredId>, CollectionError> {
         let col_arc = self.lookup(collection)?;
-        let col = col_arc
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let col = col_arc.read().unwrap_or_else(PoisonError::into_inner);
         validate_vector(query, col.spec.dimensions)?;
         if top_k == 0 {
             return Ok(Vec::new());
@@ -435,13 +771,22 @@ impl CollectionRegistry {
         id: VectorId,
     ) -> Result<bool, CollectionError> {
         let col_arc = self.lookup(collection)?;
-        let mut col = col_arc
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(tenant_idx) = col.tenants.get_mut(org_id) else {
-            return Ok(false);
+        let deleted = {
+            let mut col = col_arc.write().unwrap_or_else(PoisonError::into_inner);
+            let Some(tenant_idx) = col.tenants.get_mut(org_id) else {
+                return Ok(false);
+            };
+            let was_deleted = tenant_idx.delete(id);
+            if was_deleted {
+                col.canonical_vectors.remove(&(org_id.clone(), id));
+                col.next_seq = col.next_seq.saturating_add(1);
+            }
+            was_deleted
         };
-        Ok(tenant_idx.delete(id))
+        if deleted {
+            self.auto_persist_if_configured()?;
+        }
+        Ok(deleted)
     }
 
     /// Render the full `GET /v1/collections` JSON payload.
@@ -634,11 +979,47 @@ impl CollectionRegistry {
         let guard = self
             .collections
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(PoisonError::into_inner);
         guard
             .get(name)
             .cloned()
             .ok_or_else(|| CollectionError::NotFound(name.to_string()))
+    }
+}
+
+fn read_slice<'a>(buf: &'a [u8], cursor: &mut usize, len: usize) -> Result<&'a [u8], VektorError> {
+    let end = cursor.checked_add(len).ok_or(VektorError::WalCorruption {
+        offset: *cursor as u64,
+    })?;
+    let slice = buf.get(*cursor..end).ok_or(VektorError::WalCorruption {
+        offset: *cursor as u64,
+    })?;
+    *cursor = end;
+    Ok(slice)
+}
+
+fn read_u8(buf: &[u8], cursor: &mut usize) -> Result<u8, VektorError> {
+    let slice = read_slice(buf, cursor, 1)?;
+    Ok(slice[0])
+}
+
+fn read_u32_le(buf: &[u8], cursor: &mut usize) -> Result<u32, VektorError> {
+    let s = read_slice(buf, cursor, 4)?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn read_u64_le(buf: &[u8], cursor: &mut usize) -> Result<u64, VektorError> {
+    let s = read_slice(buf, cursor, 8)?;
+    Ok(u64::from_le_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
+}
+
+fn sync_dir_best_effort(dir: &Path) {
+    if !dir.as_os_str().is_empty() {
+        if let Ok(handle) = File::open(dir) {
+            let _ = handle.sync_all();
+        }
     }
 }
 
@@ -660,13 +1041,17 @@ fn map_col_err(err: &CollectionError, span: &TraceSpan, start: Instant) -> Strin
         CollectionError::NotFound(_) => {
             col_err_http(404, "Not Found", &err.to_string(), span, start)
         }
-        CollectionError::InvalidSpec(_) | CollectionError::Core(_) => {
+        CollectionError::InvalidSpec(_) => {
             col_err_http(400, "Bad Request", &err.to_string(), span, start)
         }
+        CollectionError::Core(VektorError::WalIo(_) | VektorError::WalCorruption { .. }) => {
+            col_err_http(500, "Internal Server Error", &err.to_string(), span, start)
+        }
+        CollectionError::Core(_) => col_err_http(400, "Bad Request", &err.to_string(), span, start),
     }
 }
 
-fn validate_collection_name(name: &str) -> Result<(), CollectionError> {
+pub(crate) fn validate_collection_name(name: &str) -> Result<(), CollectionError> {
     if name.is_empty() || name.len() > MAX_COLLECTION_NAME_LEN {
         return Err(CollectionError::InvalidSpec(
             "collection name must be 1..=128 characters".to_string(),
@@ -690,6 +1075,20 @@ mod tests {
 
     #[test]
     fn collection_registry_enforces_spec_validation_quantization_and_org_isolation() {
+        assert_eq!(
+            CollectionQuantization::parse("fp16").unwrap(),
+            CollectionQuantization::Fp16
+        );
+        assert_eq!(
+            CollectionQuantization::parse("F16").unwrap(),
+            CollectionQuantization::Fp16
+        );
+        assert_eq!(
+            CollectionQuantization::parse("half").unwrap(),
+            CollectionQuantization::Fp16
+        );
+        assert_eq!(CollectionQuantization::Fp16.as_str(), "fp16");
+
         let reg = CollectionRegistry::new();
         assert!(reg
             .create_collection(CollectionSpec::new(
@@ -710,6 +1109,7 @@ mod tests {
 
         for (name, quant) in [
             ("col_f32", CollectionQuantization::F32),
+            ("col_fp16", CollectionQuantization::Fp16),
             ("col_sq8", CollectionQuantization::Sq8),
             ("col_bq", CollectionQuantization::Bq),
         ] {
@@ -731,7 +1131,7 @@ mod tests {
         let v1 = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let v2 = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-        for col in ["col_f32", "col_sq8", "col_bq"] {
+        for col in ["col_f32", "col_fp16", "col_sq8", "col_bq"] {
             reg.upsert(col, &org_a, 10, &v1).unwrap();
             reg.upsert(col, &org_b, 20, &v2).unwrap();
 
