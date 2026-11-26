@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,7 @@ use tonic::{Request, Response, Status};
 use vektordist_core::checkpoint::{CheckpointManifest, ShardCheckpointManager};
 use vektordist_core::hnsw::{HnswIndex, HnswParams};
 use vektordist_core::wal::{replay_into_hnsw, WalLog, WalOp, WalRecord};
-use vektordist_core::{ClusterConfig, Epoch, NodeId, SeqNo, ShardId, VektorError};
+use vektordist_core::{ClusterConfig, Epoch, NodeId, SeqNo, ShardId, VektorError, WriteId};
 use vektordist_proto::v1::shard_replica_rpc_client::ShardReplicaRpcClient;
 use vektordist_proto::v1::shard_replica_rpc_server::ShardReplicaRpc;
 use vektordist_proto::v1::{
@@ -27,7 +27,106 @@ use crate::{u32_to_shard_state, ShardState};
 const REPLICATE_RPC_TIMEOUT: Duration = Duration::from_millis(500);
 const REPLICATE_BATCH_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Single owner for one logical shard's WAL, HNSW index, epoch, and replication peers.
+/// Default bounded capacity of [`WriteIdDeduplicator`] (`4,096` committed `WriteId -> SeqNo` entries).
+pub const DEFAULT_WRITE_ID_DEDUP_CAPACITY: usize = 4_096;
+
+/// Bounded FIFO deduplication cache mapping caller-supplied non-zero `(WriteId, op_tag)` keys to
+/// their originally assigned `SeqNo`, preventing duplicate WAL frames across client/network retries
+/// while bounding per-shard memory to `O(capacity)`.
+#[derive(Debug, Clone)]
+pub struct WriteIdDeduplicator {
+    entries: HashMap<(WriteId, u8), SeqNo>,
+    order: VecDeque<(WriteId, u8)>,
+    capacity: usize,
+}
+
+impl Default for WriteIdDeduplicator {
+    fn default() -> Self {
+        Self::new(DEFAULT_WRITE_ID_DEDUP_CAPACITY)
+    }
+}
+
+#[inline]
+const fn wal_op_tag(op: &WalOp) -> u8 {
+    match op {
+        WalOp::Upsert { .. } => 1,
+        WalOp::Delete { .. } => 2,
+    }
+}
+
+impl WriteIdDeduplicator {
+    /// Construct a bounded deduplicator retaining at most `capacity.max(1)` non-zero `(WriteId, op_tag)` keys.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            entries: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            capacity: cap,
+        }
+    }
+
+    /// Look up the previously committed `SeqNo` for `(write_id, op_tag)` (`write_id == 0` is never deduplicated).
+    #[must_use]
+    pub fn get_op(&self, write_id: WriteId, op_tag: u8) -> Option<SeqNo> {
+        if write_id == 0 {
+            return None;
+        }
+        self.entries.get(&(write_id, op_tag)).copied()
+    }
+
+    /// Look up the previously committed `SeqNo` for an upsert `write_id`.
+    #[must_use]
+    pub fn get(&self, write_id: WriteId) -> Option<SeqNo> {
+        self.get_op(write_id, 1)
+    }
+
+    /// Record a committed `(write_id, op_tag, seq_no)` entry, evicting the oldest entry in FIFO order if full.
+    pub fn record_op(&mut self, write_id: WriteId, op_tag: u8, seq_no: SeqNo) {
+        if write_id == 0 {
+            return;
+        }
+        let key = (write_id, op_tag);
+        if let std::collections::hash_map::Entry::Occupied(mut occ) = self.entries.entry(key) {
+            *occ.get_mut() = seq_no;
+            return;
+        }
+        while self.order.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.entries.insert(key, seq_no);
+        self.order.push_back(key);
+    }
+
+    /// Record a committed upsert `(write_id, seq_no)` pair.
+    pub fn record(&mut self, write_id: WriteId, seq_no: SeqNo) {
+        self.record_op(write_id, 1, seq_no);
+    }
+
+    /// Number of non-zero `WriteId` entries currently cached.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return `true` if the deduplicator cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Maximum number of entries retained by this deduplicator.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Single owner for one logical shard's WAL, HNSW index, epoch, idempotency table, and replication peers.
 pub struct ShardEngine {
     pub shard_id: ShardId,
     pub epoch: Epoch,
@@ -39,6 +138,7 @@ pub struct ShardEngine {
     pub hnsw: HnswIndex,
     pub wal: WalLog,
     pub records_by_seq: Vec<WalRecord>,
+    pub dedup: WriteIdDeduplicator,
 }
 
 impl ShardEngine {
@@ -55,6 +155,12 @@ impl ShardEngine {
             config.metric,
             params,
         )?;
+        let mut dedup = WriteIdDeduplicator::default();
+        for rec in &replay.records {
+            if rec.write_id != 0 {
+                dedup.record_op(rec.write_id, wal_op_tag(&rec.op), rec.seq_no);
+            }
+        }
         Ok(Self {
             shard_id,
             epoch: 1,
@@ -66,6 +172,7 @@ impl ShardEngine {
             hnsw,
             wal,
             records_by_seq: replay.records,
+            dedup,
         })
     }
 
@@ -86,7 +193,7 @@ impl ShardEngine {
         Ok(manifest)
     }
 
-    /// Apply records to WAL + HNSW if `seq_no > hnsw.last_seq_no()`.
+    /// Apply records to WAL + HNSW if `seq_no > hnsw.last_seq_no()`, updating `self.dedup`.
     pub fn apply_records(
         &mut self,
         records: &[WalRecord],
@@ -109,6 +216,12 @@ impl ShardEngine {
             self.wal.append_and_sync(first)?;
         }
         replay_into_hnsw(&new_records, &mut self.hnsw)?;
+        for rec in &new_records {
+            if rec.write_id != 0 {
+                self.dedup
+                    .record_op(rec.write_id, wal_op_tag(&rec.op), rec.seq_no);
+            }
+        }
         self.records_by_seq.extend(new_records);
         Ok(self.hnsw.last_seq_no())
     }
@@ -240,17 +353,45 @@ impl ShardReplicaRpc for NodeService {
 
             let mut next_seq = engine.hnsw.last_seq_no();
             let mut assigned = Vec::with_capacity(parsed_records.len());
-            for rec in &mut parsed_records {
+            let mut records_to_commit = Vec::with_capacity(parsed_records.len());
+            let mut batch_seen: HashMap<(WriteId, u8), SeqNo> = HashMap::new();
+
+            for mut rec in parsed_records {
+                let op_tag = wal_op_tag(&rec.op);
+                if rec.write_id != 0 {
+                    if let Some(existing_seq) = engine
+                        .dedup
+                        .get_op(rec.write_id, op_tag)
+                        .or_else(|| batch_seen.get(&(rec.write_id, op_tag)).copied())
+                    {
+                        assigned.push(existing_seq);
+                        continue;
+                    }
+                }
+
                 if rec.seq_no == 0 {
                     next_seq += 1;
                     rec.seq_no = next_seq;
                 } else if rec.seq_no > next_seq {
                     next_seq = rec.seq_no;
                 }
+                if rec.write_id != 0 {
+                    batch_seen.insert((rec.write_id, op_tag), rec.seq_no);
+                }
                 assigned.push(rec.seq_no);
+                records_to_commit.push(rec);
             }
 
-            if let Err(e) = engine.apply_records(&parsed_records, req.batched_fsync) {
+            if records_to_commit.is_empty() {
+                return Ok(Response::new(AppendQuorumResponse {
+                    status_code: STATUS_OK,
+                    current_epoch: engine.epoch,
+                    assigned_seq_nos: assigned,
+                    error_message: String::new(),
+                }));
+            }
+
+            if let Err(e) = engine.apply_records(&records_to_commit, req.batched_fsync) {
                 return Ok(Response::new(AppendQuorumResponse {
                     status_code: STATUS_INTERNAL,
                     current_epoch: engine.epoch,
@@ -264,7 +405,7 @@ impl ShardReplicaRpc for NodeService {
                 engine.write_quorum,
                 engine.follower_addrs.clone(),
                 engine.recovering_follower_addr.clone(),
-                parsed_records,
+                records_to_commit,
                 assigned,
             )
         };
@@ -563,5 +704,34 @@ pub fn format_endpoint(addr: &str) -> String {
         addr.to_string()
     } else {
         format!("http://{addr}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_id_deduplicator_enforces_fifo_eviction_and_ignores_zero() {
+        let mut dedup = WriteIdDeduplicator::new(3);
+        assert_eq!(dedup.capacity(), 3);
+        assert!(dedup.is_empty());
+
+        dedup.record(0, 99);
+        assert_eq!(dedup.get(0), None);
+        assert!(dedup.is_empty());
+
+        dedup.record(101, 1);
+        dedup.record(102, 2);
+        dedup.record(103, 3);
+        assert_eq!(dedup.len(), 3);
+        assert_eq!(dedup.get(101), Some(1));
+
+        // Recording a 4th distinct WriteId evicts oldest (101).
+        dedup.record(104, 4);
+        assert_eq!(dedup.len(), 3);
+        assert_eq!(dedup.get(101), None);
+        assert_eq!(dedup.get(102), Some(2));
+        assert_eq!(dedup.get(104), Some(4));
     }
 }

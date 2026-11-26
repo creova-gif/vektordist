@@ -5,7 +5,9 @@
 //! Distributed cluster control plane (`TopologyStore`) and data plane (`ShardEngine`, `ClusterClient`).
 
 pub mod backup;
+pub mod chaos;
 pub mod client;
+pub mod collections;
 pub mod coord;
 pub mod gateway;
 pub mod node;
@@ -13,6 +15,7 @@ pub mod placement;
 pub mod raft;
 pub mod sdk;
 pub mod security;
+pub mod telemetry;
 
 pub use vektordist_core::{ClusterConfig, Epoch, NodeId, ShardId, VektorError};
 

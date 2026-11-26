@@ -52,8 +52,9 @@ Measured via `cargo run --release -- bench --vectors 3000 --dimensions 768 --que
 | Index Tier | Payload / Heap Footprint | Compression vs `f32` | `p50` Latency (`--release`) | `p95` Latency (`--release`) | `Recall@10` |
 | --- | --- | --- | --- | --- | --- |
 | **`ExactIndex` (`f32` NEON)** | `8.87 MiB` arena | `1.0x` | `0.29 ms` | `0.34 ms` | `100.00%` |
-| **`HnswIndex` (`f32` NEON)** | `9.77 MiB` total heap | `1.0x` | `0.12 ms` | `0.31 ms` | **`100.00%`** |
-| **`Sq8HnswIndex` (`u8` + `3x` Rerank)** | `3.17 MiB` total heap | **`4.0x` payload** | `0.15 ms` | `0.21 ms` | **`100.00%`** |
+| **`HnswIndex` (`f32` NEON)** | `9.78 MiB` total heap | `1.0x` | `0.14 ms` | `0.19 ms` | **`100.00%`** |
+| **`Fp16HnswIndex` (`f16` `binary16`, M16)** | `5.39 MiB` total heap | **`2.0x` payload** | `0.53 ms` | `0.59 ms` | **`100.00%`** |
+| **`Sq8HnswIndex` (`u8` + `3x` Rerank)** | `3.17 MiB` total heap | **`4.0x` payload** | `0.16 ms` | `0.24 ms` | **`100.00%`** |
 | **`BqIndex` (`1-bit` POPCNT + `10x` Rerank, M7)** | `281.2 KiB` (`96 B/vec`) | **`32.0x` payload** | **`0.08 ms`** | **`0.11 ms`** | **`100.00%`** |
 | **`AdaptiveSearchController` (M6)** | Shared `HnswIndex` | `1.0x` | `0.18 ms` | `0.30 ms` | **`100.00%`** |
 

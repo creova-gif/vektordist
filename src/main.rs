@@ -22,6 +22,7 @@ use vektordist_cluster::security::{OrgId, SecurityGate, TenantQuotaPolicy, Tenan
 use vektordist_core::adaptive::{AdaptiveSearchConfig, AdaptiveSearchController};
 use vektordist_core::arena::{cosine_similarity, normalize_l2};
 use vektordist_core::exact::{ExactIndex, ScoredId, SeededRng};
+use vektordist_core::fp16::Fp16HnswIndex;
 use vektordist_core::hnsw::{recall_at_k, HnswIndex, HnswParams};
 use vektordist_core::pq_bq::BqIndex;
 use vektordist_core::quant::{Sq8HnswIndex, Sq8Quantizer};
@@ -511,6 +512,12 @@ fn run_exact_and_hnsw_benchmark(
         DistanceMetric::Cosine,
         HnswParams::default(),
     )?;
+    let mut fp16 = Fp16HnswIndex::with_capacity(
+        dimensions,
+        hnsw_sample,
+        DistanceMetric::Cosine,
+        HnswParams::default(),
+    )?;
     let mut sq8 = Sq8HnswIndex::with_capacity(
         Sq8Quantizer::for_unit_vectors(dimensions)?,
         hnsw_sample,
@@ -534,6 +541,7 @@ fn run_exact_and_hnsw_benchmark(
         }
         exact_sub.upsert(id as u64, &buf)?;
         hnsw.upsert(id as u64, &buf)?;
+        fp16.upsert(id as u64, &buf)?;
         sq8.upsert(id as u64, &buf)?;
         bq.upsert(id as u64, &buf)?;
     }
@@ -541,10 +549,12 @@ fn run_exact_and_hnsw_benchmark(
 
     let controller = AdaptiveSearchController::new(AdaptiveSearchConfig::default())?;
     let mut hnsw_lat = Vec::with_capacity(queries);
+    let mut fp16_lat = Vec::with_capacity(queries);
     let mut sq8_lat = Vec::with_capacity(queries);
     let mut bq_lat = Vec::with_capacity(queries);
     let mut adaptive_lat = Vec::with_capacity(queries);
     let mut recall_sum = 0.0_f64;
+    let mut fp16_recall_sum = 0.0_f64;
     let mut sq8_recall_sum = 0.0_f64;
     let mut bq_recall_sum = 0.0_f64;
     let mut adaptive_recall_sum = 0.0_f64;
@@ -562,6 +572,11 @@ fn run_exact_and_hnsw_benchmark(
         hnsw_lat.push(t0.elapsed().as_secs_f64() * 1000.0);
         recall_sum += recall_at_k(&truth, &approx, top_k);
 
+        let t_f16 = Instant::now();
+        let fp16_hits = fp16.search(&buf, top_k)?;
+        fp16_lat.push(t_f16.elapsed().as_secs_f64() * 1000.0);
+        fp16_recall_sum += recall_at_k(&truth, &fp16_hits, top_k);
+
         let t1 = Instant::now();
         let sq8_hits = sq8.search_reranked_with_arena(&buf, top_k, 64, 3, Some(hnsw.arena()))?;
         sq8_lat.push(t1.elapsed().as_secs_f64() * 1000.0);
@@ -578,11 +593,13 @@ fn run_exact_and_hnsw_benchmark(
         adaptive_recall_sum += recall_at_k(&truth, &adap_hits, top_k);
     }
     hnsw_lat.sort_by(f64::total_cmp);
+    fp16_lat.sort_by(f64::total_cmp);
     sq8_lat.sort_by(f64::total_cmp);
     bq_lat.sort_by(f64::total_cmp);
     adaptive_lat.sort_by(f64::total_cmp);
 
     let hnsw_mb = (hnsw.memory_bytes() as f64) / (1024.0 * 1024.0);
+    let fp16_mb = (fp16.memory_bytes() as f64) / (1024.0 * 1024.0);
     let sq8_mb = (sq8.memory_bytes() as f64) / (1024.0 * 1024.0);
     let bq_payload_kb = (bq.arena().vector_bytes() as f64) / 1024.0;
     println!(
@@ -590,6 +607,12 @@ fn run_exact_and_hnsw_benchmark(
         percentile(&hnsw_lat, 50.0),
         percentile(&hnsw_lat, 95.0),
         (recall_sum / (queries as f64)) * 100.0
+    );
+    println!(
+        "fp16 (f16, n={hnsw_sample}): mem_mb={fp16_mb:.2} (2x) p50_ms={:.2} p95_ms={:.2} recall@{top_k}={:.2}%",
+        percentile(&fp16_lat, 50.0),
+        percentile(&fp16_lat, 95.0),
+        (fp16_recall_sum / (queries as f64)) * 100.0
     );
     println!(
         "sq8  (u8,  n={hnsw_sample}): mem_mb={sq8_mb:.2} p50_ms={:.2} p95_ms={:.2} recall@{top_k}={:.2}%",

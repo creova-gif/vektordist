@@ -1,13 +1,15 @@
-//! Milestone 13: Ergonomic typed async Rust Client SDK (`HttpVektorClient`) over the HTTP/1.1
-//! zero-trust gateway with automatic `Authorization`, `X-Org-Id`, and W3C `traceparent` header
-//! injection plus bounded exponential retry on transient `429` / `503` responses.
+//! Ergonomic typed async Rust Client SDK (`HttpVektorClient`) over the HTTP/1.1 zero-trust
+//! gateway with automatic `Authorization`, `X-Org-Id`, and W3C `traceparent` header injection,
+//! bounded exponential retry on transient `429` / `503` responses, OpenAPI `3.1.0` discovery,
+//! and multi-collection namespace management.
 
 use std::fmt::Write as _;
 use std::time::Duration;
 
 use vektordist_core::exact::ScoredId;
-use vektordist_core::{SeqNo, ShardId, VectorId, VektorError, WriteId};
+use vektordist_core::{DistanceMetric, SeqNo, ShardId, VectorId, VektorError, WriteId};
 
+use crate::collections::{metric_as_str, CollectionQuantization};
 use crate::gateway::{send_http_request, HttpResponse, TraceSpan};
 
 const DEFAULT_MAX_RETRIES: usize = 3;
@@ -128,6 +130,13 @@ impl HttpVektorClient {
         })
     }
 
+    /// Fetch the public OpenAPI `3.1.0` JSON specification from `GET /openapi.json`.
+    pub async fn openapi_raw(&self) -> Result<String, VektorError> {
+        let resp = self.send_once("GET", "/openapi.json", "").await?;
+        ensure_http_ok(&resp)?;
+        Ok(resp.body)
+    }
+
     /// Perform a single quorum-durable vector upsert via `POST /v1/upsert`.
     pub async fn upsert(
         &self,
@@ -220,6 +229,91 @@ impl HttpVektorClient {
         Ok(resp.body)
     }
 
+    /// Create a new multi-collection vector namespace via `POST /v1/collections` (`TenantRole::Admin`).
+    pub async fn create_collection(
+        &self,
+        name: &str,
+        dims: usize,
+        metric: DistanceMetric,
+        quantization: CollectionQuantization,
+    ) -> Result<String, VektorError> {
+        let body = format!(
+            "{{\"name\":\"{name}\",\"dimensions\":{dims},\"metric\":\"{}\",\"quantization\":\"{}\"}}",
+            metric_as_str(metric),
+            quantization.as_str()
+        );
+        let resp = self
+            .send_with_retry("POST", "/v1/collections", &body)
+            .await?;
+        ensure_http_status(&resp, &[200, 201])?;
+        Ok(resp.body)
+    }
+
+    /// List all collections in raw JSON format via `GET /v1/collections` (`TenantRole::Reader`).
+    pub async fn list_collections_raw(&self) -> Result<String, VektorError> {
+        let resp = self.send_with_retry("GET", "/v1/collections", "").await?;
+        ensure_http_ok(&resp)?;
+        Ok(resp.body)
+    }
+
+    /// Drop an existing collection via `DELETE /v1/collections/<name>` (`TenantRole::Admin`).
+    pub async fn drop_collection(&self, name: &str) -> Result<(), VektorError> {
+        let path = format!("/v1/collections/{name}");
+        let resp = self.send_with_retry("DELETE", &path, "").await?;
+        ensure_http_ok(&resp)?;
+        Ok(())
+    }
+
+    /// Upsert `(id, vector)` into `collection` scoped to caller's `X-Org-Id` via `POST /v1/collections/<name>/upsert`.
+    pub async fn collection_upsert(
+        &self,
+        collection: &str,
+        id: VectorId,
+        vector: &[f32],
+    ) -> Result<(), VektorError> {
+        let path = format!("/v1/collections/{collection}/upsert");
+        let mut body = format!("{{\"id\":{id},\"vector\":[");
+        append_f32_slice(&mut body, vector);
+        body.push_str("]}");
+
+        let resp = self.send_with_retry("POST", &path, &body).await?;
+        ensure_http_ok(&resp)?;
+        Ok(())
+    }
+
+    /// Execute a tenant-isolated top-`k` search inside `collection` via `POST /v1/collections/<name>/search`.
+    pub async fn collection_search(
+        &self,
+        collection: &str,
+        query: &[f32],
+        top_k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<ScoredId>, VektorError> {
+        let path = format!("/v1/collections/{collection}/search");
+        let mut body = format!("{{\"top_k\":{top_k},\"ef_search\":{ef_search},\"query\":[");
+        append_f32_slice(&mut body, query);
+        body.push_str("]}");
+
+        let resp = self.send_with_retry("POST", &path, &body).await?;
+        ensure_http_ok(&resp)?;
+        parse_search_hits(&resp.body).ok_or(VektorError::InvalidConfig(
+            "invalid 'hits' payload in collection search response",
+        ))
+    }
+
+    /// Delete `id` inside `collection` scoped to caller's `X-Org-Id` via `POST /v1/collections/<name>/delete`.
+    pub async fn collection_delete(
+        &self,
+        collection: &str,
+        id: VectorId,
+    ) -> Result<bool, VektorError> {
+        let path = format!("/v1/collections/{collection}/delete");
+        let body = format!("{{\"id\":{id}}}");
+        let resp = self.send_with_retry("POST", &path, &body).await?;
+        ensure_http_ok(&resp)?;
+        Ok(parse_json_bool(&resp.body, "deleted").unwrap_or(false))
+    }
+
     /// Send an arbitrary HTTP request with automatic `Authorization`, `X-Org-Id`, and `traceparent`
     /// headers, returning the raw [`HttpResponse`] after bounded transient retries.
     pub async fn send_raw(
@@ -289,7 +383,11 @@ impl HttpVektorClient {
 }
 
 fn ensure_http_ok(resp: &HttpResponse) -> Result<(), VektorError> {
-    if resp.status_code == 200 {
+    ensure_http_status(resp, &[200])
+}
+
+fn ensure_http_status(resp: &HttpResponse, allowed: &[u16]) -> Result<(), VektorError> {
+    if allowed.contains(&resp.status_code) {
         Ok(())
     } else {
         Err(VektorError::WalIo(format!(

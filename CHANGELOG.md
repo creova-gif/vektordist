@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-26
+
+Performance optimization, multi-collection architecture, gateway resilience, and polyglot developer ecosystem release of **VektorDist**, spanning **Milestones M16 through M19**: zero-allocation `VisitedPool` HNSW search & IEEE 754 `FP16` 2x quantization, modular gateway/telemetry/chaos architecture with Slowloris & concurrency protection plus `WriteIdDeduplicator` idempotency, named Multi-Collection `/v1/collections/*` management, OpenAPI `3.1.0` contract, zero-dependency typed Python SDK, and turnkey Docker Compose + Prometheus observability stack.
+
+### Added
+
+- **Zero-Allocation HNSW Traversal & IEEE 754 `FP16` Quantization (M16):**
+  - Thread-safe `VisitedPool` scratch-buffer reuse with generation-counter stamp clearing, eliminating per-query `HashSet` heap allocations across hot HNSW graph traversals.
+  - Hardware-friendly IEEE 754 half-precision (`FP16`) vector storage and SIMD-friendly conversion kernels delivering **2.0x** memory reduction with near-lossless cosine/L2 recall parity between `f32` and `SQ8` tiers.
+- **Modular Gateway Architecture, Bounded Telemetry & Idempotent Quorum Writes (M17):**
+  - Refactored `vektordist-cluster` into dedicated `telemetry`, `chaos`, and `gateway` modules with a fixed-capacity ring-buffer `BoundedLatencyWindow` eliminating unbounded latency sample growth under sustained traffic.
+  - Hardened HTTP/1.1 gateway transport with Slowloris read deadlines (`408 Request Timeout`), bounded `tokio::sync::Semaphore` in-flight connection admission control, and `WriteIdDeduplicator` guaranteeing idempotent quorum retries without duplicate WAL side effects.
+- **Multi-Collection Engine & Live OpenAPI Discovery (M18):**
+  - First-class named collection registry and REST lifecycle (`POST /v1/collections`, `GET /v1/collections`, `GET /v1/collections/{name}`, `DELETE /v1/collections/{name}`, and `/v1/collections/{name}/{upsert,search,delete}`) supporting independent dimensions, distance metrics (`cosine`, `l2`), and quantization tiers (`f32`, `fp16`, `sq8`, `bq`) per collection, plus `GET /openapi.json` schema discovery.
+- **OpenAPI 3.1 Specification, Zero-Dependency Python SDK & Docker Compose Stack (M19):**
+  - Checked-in OpenAPI `3.1.0` specification (`docs/openapi.yaml`) covering all observability, sharded vector, topology/audit, and multi-collection endpoints, `BearerAuth` security scheme, `X-Org-Id` multi-tenancy, and W3C `traceparent` headers.
+  - Zero-dependency `mypy --strict`-verified Python client SDK (`clients/python/vektordist_client.py`) with typed `ScoredHit` / `UpsertAck` models, W3C `traceparent` generation, bounded `429` (`Retry-After`) & `503` retries, typed exception hierarchy, and live `ThreadingHTTPServer` integration test suite.
+  - Turnkey multi-container Docker Compose cluster (`deploy/docker-compose.yml` + `deploy/prometheus.yml`) launching `coord`, 3 persistent `node` replicas, `/readyz`-probed `gateway`, and `prom/prometheus:v2.54.1` scraping `/metrics` every `5s`.
+
 ## [0.2.0] - 2026-11-26
 
 Production hardening and scale-readiness release of **VektorDist**, spanning **Milestones M12 through M15**: bounded WAL storage via atomic binary checkpointing, pooled HTTP/2 gRPC transport & bulk ingestion, graceful `/readyz` gateway draining & ergonomic Rust client SDK, Raft-replicated zero-trust key/quota management with durable audit logs, `1M`-vector scale verification, and enterprise Kubernetes SRE operations.
@@ -70,6 +89,7 @@ Initial open-source release of **VektorDist**, spanning **Milestones M1 through 
   - Declarative `VektorNodeConfig` (`vektordist node --config` and `VEKTORDIST_*` environment overrides), `vektordist keygen` token provisioning CLI, enriched `ratatui` cluster dashboard (`[k]` kill, `[a]` add, `[p]` pause/resume, `[r]` reset, latency sparkline, shard health summary), `vektordist chaos` automated SLA runner, and `quickstart_hybrid_agent_rag` example.
   - Full open-source governance suite (`LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, GitHub issue/PR templates, CI + multi-arch release tarballs with SHA-256 checksums).
 
-[Unreleased]: https://github.com/creova-gif/vektordist/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/creova-gif/vektordist/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/creova-gif/vektordist/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/creova-gif/vektordist/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/creova-gif/vektordist/releases/tag/v0.1.0
