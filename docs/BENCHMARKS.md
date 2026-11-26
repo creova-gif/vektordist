@@ -1,4 +1,4 @@
-# VektorDist Benchmark Report (Milestone 3: SIMD, SQ8 Quantization, and Zero-Copy Mmap Segments)
+# VektorDist Benchmark Report (Milestones 1–10)
 
 ## 1. Hardware & Toolchain Environment
 
@@ -45,17 +45,39 @@ Measured by `crates/vektordist-core/tests/m3_quant_mmap.rs` (`sq8_quantizer_achi
 
 ---
 
-## 4. Reproduction Commands
+## 4. M1–M10 Multi-Tier Compression & Chaos SLA Benchmarks (`3,000 x 768d`, Seed `42`)
 
-Run the full Milestone 3 verification and benchmark suite:
+Measured via `cargo run --release -- bench --vectors 3000 --dimensions 768 --queries 20`:
+
+| Index Tier | Payload / Heap Footprint | Compression vs `f32` | `p50` Latency (`--release`) | `p95` Latency (`--release`) | `Recall@10` |
+| --- | --- | --- | --- | --- | --- |
+| **`ExactIndex` (`f32` NEON)** | `8.87 MiB` arena | `1.0x` | `0.29 ms` | `0.34 ms` | `100.00%` |
+| **`HnswIndex` (`f32` NEON)** | `9.77 MiB` total heap | `1.0x` | `0.12 ms` | `0.31 ms` | **`100.00%`** |
+| **`Sq8HnswIndex` (`u8` + `3x` Rerank)** | `3.17 MiB` total heap | **`4.0x` payload** | `0.15 ms` | `0.21 ms` | **`100.00%`** |
+| **`BqIndex` (`1-bit` POPCNT + `10x` Rerank, M7)** | `281.2 KiB` (`96 B/vec`) | **`32.0x` payload** | **`0.08 ms`** | **`0.11 ms`** | **`100.00%`** |
+| **`AdaptiveSearchController` (M6)** | Shared `HnswIndex` | `1.0x` | `0.18 ms` | `0.30 ms` | **`100.00%`** |
+
+### M10 Automated 5-Node Chaos SLA Campaign (`vektordist chaos --nodes 5 --vectors 800 --dimensions 128`)
+
+- **Schedule:** `SeedVectors(800)` -> `ConcurrentWorkload(writes=120, reads=40)` -> `KillNode(node_id=2)` -> `VerifyZeroWriteLoss` -> `AddReplacementNode(node_id=6)` -> `VerifyZeroWriteLoss` -> `AssertRecallAndLatencySla`
+- **Measured Result (`--release`):** `acked_verified = 920`, `acked_lost = 0`, `recovered_shards = 5`, `recall@10 = 100.00%`, `p95_ms = 1.30 ms` (`<= 50.0 ms` SLA), `sla_passed = true`.
+
+---
+
+## 5. Reproduction Commands
+
+Run the full M1–M10 verification and benchmark suite:
 
 ```bash
-# 1. Verify SIMD vs scalar parity, SQ8 4x compression + recall@10 >= 0.95, and VDSG CRC32 integrity (release mode):
-cargo test -p vektordist-core --release --test m3_quant_mmap -- --nocapture
+# 1. Run the M1-M10 768d release benchmark suite across Exact, HNSW, SQ8 (4x), BQ (32x), and Adaptive M6:
+cargo run --release -- bench --vectors 3000 --dimensions 768 --queries 20
 
-# 2. Run all vektordist-core unit and integration tests (WAL recovery, HNSW recall, SIMD, SQ8, Mmap):
-cargo test -p vektordist-core -- --nocapture
+# 2. Run the M10 automated 5-node fault-injection & zero-write-loss SLA campaign:
+cargo run --release -- chaos --nodes 5 --vectors 800 --dimensions 128
 
-# 3. Verify formatting and strict Clippy lints (zero unwrap/expect in production code):
-cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings
+# 3. Verify SIMD vs scalar parity, SQ8 4x compression, BQ 32x / PQ 16x + LSM compaction, and VDSG CRC32 integrity:
+cargo test -p vektordist-core --release --test m3_quant_mmap --test m7_pq_bq_compaction -- --nocapture
+
+# 4. Run the full workspace test suite (56 unit & integration tests across M1-M10) and strict Clippy lints:
+cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```

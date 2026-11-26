@@ -7,9 +7,11 @@
 pub mod backup;
 pub mod client;
 pub mod coord;
+pub mod gateway;
 pub mod node;
 pub mod placement;
 pub mod raft;
+pub mod security;
 
 pub use vektordist_core::{ClusterConfig, Epoch, NodeId, ShardId, VektorError};
 
