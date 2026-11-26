@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-26
+
+Production hardening and scale-readiness release of **VektorDist**, spanning **Milestones M12 through M15**: bounded WAL storage via atomic binary checkpointing, pooled HTTP/2 gRPC transport & bulk ingestion, graceful `/readyz` gateway draining & ergonomic Rust client SDK, Raft-replicated zero-trust key/quota management with durable audit logs, `1M`-vector scale verification, and enterprise Kubernetes SRE operations.
+
+### Added
+
+- **Bounded Storage, Atomic WAL Checkpointing & Pooled Bulk Ingestion (M12):**
+  - `ShardCheckpointManager` pairing CRC32-verified checkpoint metadata (`b"VDCK"`) with 8-byte-aligned zero-copy `PersistentVectorSegment` (`b"VDSG"`) snapshots and crash-safe atomic WAL compaction (`write-tmp -> fsync -> rename`), reclaiming disk space and bounding cold-start replay latency.
+  - `GrpcChannelPool` multiplexing persistent HTTP/2 tonic channels across shard primaries and followers, eliminating per-RPC TCP connection churn on hot paths.
+  - High-throughput bulk ingestion via shard-grouped `ClusterClient::upsert_batch` and `POST /v1/upsert_batch` with `W=2` quorum durability.
+- **Graceful Gateway Draining, DoS Guards & Rust Client SDK (M13):**
+  - `GET /readyz` Kubernetes readiness & graceful shutdown drain endpoint (`503 Service Unavailable` while draining or unready) decoupled from `GET /healthz` process liveness, plus `413 Content Too Large` request-body DoS protection.
+  - Ergonomic `HttpVektorClient` Rust SDK supporting bearer-token authentication, tenant scoping (`X-Org-Id`), single/batch upserts, search, quorum deletes, topology/audit inspection, and `traceparent` propagation.
+- **Distributed Zero-Trust Security & Durable Audit Log (M14):**
+  - Raft-replicated `SecurityGate` state machine synchronizing dynamic API key issuance (`IssueApiKey`), instant cluster-wide key revocation (`RevokeApiKey`), and live `TenantQuotaPolicy` updates across stateless gateway replicas.
+  - Crash-safe, append-only `PersistentAuditLog` persisting hash-chained `AuditEntry` records to disk with `fsync` durability and genesis-to-head tamper verification (`GET /v1/audit`).
+- **Pre-Flight Diagnostics, `1M`-Vector Scale Harness & Enterprise SRE Operations (M15):**
+  - `vektordist doctor` pre-flight environment, configuration, `fsync`, and security diagnostics CLI, alongside streaming `1M`-vector `vektordist bench-scale` memory and latency verification.
+  - Hardened multi-document Kubernetes manifest (`deploy/k8s/statefulset.yaml`) with `PodDisruptionBudget` (`minAvailable: 4` preserving `W=2` of `RF=3` quorum), host/zone `PodAntiAffinity`, zero-trust non-root (`65532:65532`) read-only rootfs `securityContext`, `vektordist-gateway` HA deployment with `/readyz` + `/healthz` probes & Prometheus scrape annotations, updated distroless `deploy/Dockerfile`, and authoritative production runbook (`docs/OPERATIONS.md`).
+
 ## [0.1.0] - 2026-11-26
 
 Initial open-source release of **VektorDist**, spanning **Milestones M1 through M11** from core sharded HNSW storage and quorum WAL failover through distributed Raft consensus, multi-tier quantization, hybrid multi-tenant retrieval, zero-trust RBAC/audit security, programmable AI agent memory, and authenticated cloud-native observability.
@@ -50,5 +70,6 @@ Initial open-source release of **VektorDist**, spanning **Milestones M1 through 
   - Declarative `VektorNodeConfig` (`vektordist node --config` and `VEKTORDIST_*` environment overrides), `vektordist keygen` token provisioning CLI, enriched `ratatui` cluster dashboard (`[k]` kill, `[a]` add, `[p]` pause/resume, `[r]` reset, latency sparkline, shard health summary), `vektordist chaos` automated SLA runner, and `quickstart_hybrid_agent_rag` example.
   - Full open-source governance suite (`LICENSE`, `CONTRIBUTING.md`, `SECURITY.md`, GitHub issue/PR templates, CI + multi-arch release tarballs with SHA-256 checksums).
 
-[Unreleased]: https://github.com/creova-gif/vektordist/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/creova-gif/vektordist/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/creova-gif/vektordist/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/creova-gif/vektordist/releases/tag/v0.1.0

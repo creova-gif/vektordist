@@ -221,7 +221,22 @@ impl HnswIndex {
             }
             DistanceMetric::L2 => self.arena.upsert(id, vector)?,
         };
+        Ok(self.connect_new_slot(new_slot))
+    }
 
+    /// Insert an already-metric-prepared vector from a durable checkpoint segment without
+    /// re-normalizing `Cosine` vectors, preserving bit-exact `f32` payloads across restarts.
+    pub(crate) fn upsert_checkpoint_vector(
+        &mut self,
+        id: VectorId,
+        stored_vector: &[f32],
+    ) -> Result<usize, VektorError> {
+        validate_vector(stored_vector, self.arena.dims())?;
+        let new_slot = self.arena.upsert(id, stored_vector)?;
+        Ok(self.connect_new_slot(new_slot))
+    }
+
+    fn connect_new_slot(&mut self, new_slot: usize) -> usize {
         let target_level = self.sample_level();
         let mut node_layers = Vec::with_capacity(target_level + 1);
         for level in 0..=target_level {
@@ -236,11 +251,11 @@ impl HnswIndex {
 
         let Some((mut cur_ep, max_level)) = self.entry_point else {
             self.entry_point = Some((new_slot, target_level));
-            return Ok(new_slot);
+            return new_slot;
         };
 
         let Some(query_vec) = self.arena.vector_at_slot(new_slot) else {
-            return Ok(new_slot);
+            return new_slot;
         };
         let query_owned = query_vec.to_vec();
 
@@ -301,7 +316,7 @@ impl HnswIndex {
             self.entry_point = Some((new_slot, target_level));
         }
 
-        Ok(new_slot)
+        new_slot
     }
 
     /// Approximate top-`k` nearest-neighbor search over the HNSW graph.

@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use vektordist_core::exact::ScoredId;
 use vektordist_core::wal::{WalOp, WalRecord};
@@ -22,32 +23,123 @@ use vektordist_proto::{
 use crate::node::format_endpoint;
 use crate::{u32_to_shard_state, ShardState};
 
+const CHANNEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const SEARCH_SHARD_TIMEOUT: Duration = Duration::from_millis(200);
 const WRITE_QUORUM_TIMEOUT: Duration = Duration::from_millis(500);
 const SEED_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Smart direct-to-primary cluster client (Shape 2) with cached `TopologySnapshot`
-/// and automatic retry-on-`WRONG_EPOCH` / dead-replica fallback.
+/// Thread-safe HTTP/2 gRPC channel pool caching connected `tonic::transport::Channel` handles
+/// per normalized endpoint (`http://...`) to eliminate per-RPC TCP/HTTP2 handshake churn.
+#[derive(Debug, Clone, Default)]
+pub struct GrpcChannelPool {
+    channels: Arc<RwLock<HashMap<String, Channel>>>,
+}
+
+impl GrpcChannelPool {
+    /// Construct an empty `GrpcChannelPool`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of currently cached endpoint channels in the pool.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.channels.read().map_or(0, |g| g.len())
+    }
+
+    /// Returns `true` if no channels are currently cached.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return a cached `Channel` for `endpoint` or establish and cache a new HTTP/2 connection
+    /// bounded by `connect_timeout(500ms)` and `rpc_timeout`.
+    pub async fn get_or_connect(
+        &self,
+        endpoint: &str,
+        rpc_timeout: Duration,
+    ) -> Result<Channel, String> {
+        let normalized = format_endpoint(endpoint);
+        if let Ok(guard) = self.channels.read() {
+            if let Some(existing) = guard.get(&normalized) {
+                return Ok(existing.clone());
+            }
+        }
+
+        let ep = Endpoint::from_shared(normalized.clone())
+            .map_err(|e| e.to_string())?
+            .connect_timeout(CHANNEL_CONNECT_TIMEOUT)
+            .tcp_nodelay(true);
+
+        let connect_cap = rpc_timeout.min(CHANNEL_CONNECT_TIMEOUT);
+        let connected = tokio::time::timeout(connect_cap, ep.connect())
+            .await
+            .map_err(|_| "connect timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+
+        if let Ok(mut guard) = self.channels.write() {
+            let ch = guard
+                .entry(normalized)
+                .or_insert_with(|| connected.clone())
+                .clone();
+            return Ok(ch);
+        }
+        Ok(connected)
+    }
+
+    /// Evict any cached channel for `endpoint` after a transport failure or timeout so subsequent
+    /// retries establish a fresh connection.
+    pub fn evict(&self, endpoint: &str) {
+        let normalized = format_endpoint(endpoint);
+        if let Ok(mut guard) = self.channels.write() {
+            guard.remove(&normalized);
+            guard.remove(endpoint);
+        }
+    }
+}
+
+/// Smart direct-to-primary cluster client (Shape 2) with cached `TopologySnapshot`,
+/// pooled HTTP/2 gRPC channels (`GrpcChannelPool`), and automatic retry-on-`WRONG_EPOCH` /
+/// dead-replica fallback.
 #[derive(Clone)]
 pub struct ClusterClient {
     coord_addr: String,
     topology: Arc<RwLock<GetTopologyResponse>>,
+    pool: GrpcChannelPool,
 }
 
 impl ClusterClient {
-    /// Connect to the coordinator at `coord_addr` and fetch the initial `GetTopologyResponse`.
+    /// Connect to the coordinator at `coord_addr` using a fresh `GrpcChannelPool` and fetch the
+    /// initial `GetTopologyResponse`.
     pub async fn connect(coord_addr: impl Into<String>) -> Result<Self, VektorError> {
+        Self::connect_with_pool(coord_addr, GrpcChannelPool::new()).await
+    }
+
+    /// Connect to the coordinator at `coord_addr` sharing an explicit `GrpcChannelPool`.
+    pub async fn connect_with_pool(
+        coord_addr: impl Into<String>,
+        pool: GrpcChannelPool,
+    ) -> Result<Self, VektorError> {
         let addr = coord_addr.into();
-        let topo = fetch_topology(&addr).await?;
+        let topo = fetch_topology(&pool, &addr).await?;
         Ok(Self {
             coord_addr: addr,
             topology: Arc::new(RwLock::new(topo)),
+            pool,
         })
+    }
+
+    /// Borrow the underlying HTTP/2 `GrpcChannelPool`.
+    #[must_use]
+    pub fn channel_pool(&self) -> &GrpcChannelPool {
+        &self.pool
     }
 
     /// Refresh the cached topology snapshot from the coordinator.
     pub async fn refresh_topology(&self) -> Result<GetTopologyResponse, VektorError> {
-        let topo = fetch_topology(&self.coord_addr).await?;
+        let topo = fetch_topology(&self.pool, &self.coord_addr).await?;
         if let Ok(mut guard) = self.topology.write() {
             *guard = topo.clone();
         }
@@ -112,6 +204,121 @@ impl ClusterClient {
             .await
     }
 
+    /// Validate vector dimensions, partition `records` across logical shards via `cfg.shard_for(id)`,
+    /// and dispatch batched `W=2` quorum writes (`batched_fsync = true`) concurrently across target
+    /// shard primaries with automatic topology-refresh retry on `STATUS_WRONG_EPOCH` or transport
+    /// failure. Returns the total count of durably acknowledged vectors.
+    pub async fn upsert_batch(
+        &self,
+        records: &[(VectorId, WriteId, Vec<f32>)],
+    ) -> Result<usize, VektorError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let cfg = self.cluster_config();
+        let mut by_shard: BTreeMap<ShardId, Vec<WireWalRecord>> = BTreeMap::new();
+        for (id, write_id, vector) in records {
+            if vector.len() != cfg.dimensions {
+                return Err(VektorError::DimensionMismatch {
+                    expected: cfg.dimensions,
+                    actual: vector.len(),
+                });
+            }
+            if vector.iter().any(|v| !v.is_finite()) {
+                return Err(VektorError::InvalidVector("vector contains NaN or Inf"));
+            }
+            let shard_id = cfg.shard_for(*id);
+            by_shard.entry(shard_id).or_default().push(WireWalRecord {
+                seq_no: 0,
+                write_id: *write_id,
+                op_kind: WIRE_OP_UPSERT,
+                vector_id: *id,
+                vector_f32_le: encode_f32_le(vector),
+            });
+        }
+
+        let mut tasks = Vec::with_capacity(by_shard.len());
+        for (shard_id, wire_records) in by_shard {
+            let client = self.clone();
+            let write_quorum = cfg.write_quorum;
+            tasks.push(tokio::spawn(async move {
+                client
+                    .append_batch_quorum_for_shard(shard_id, wire_records, write_quorum)
+                    .await
+            }));
+        }
+
+        let mut total_acked = 0_usize;
+        for task in tasks {
+            let acked = task
+                .await
+                .map_err(|e| VektorError::WalIo(format!("upsert_batch task join error: {e}")))??;
+            total_acked = total_acked.saturating_add(acked);
+        }
+        Ok(total_acked)
+    }
+
+    async fn append_batch_quorum_for_shard(
+        &self,
+        shard_id: ShardId,
+        wire_records: Vec<WireWalRecord>,
+        write_quorum: u8,
+    ) -> Result<usize, VektorError> {
+        for attempt in 0..2 {
+            let Some(shard) = self.get_shard_assignment(shard_id) else {
+                let _ = self.refresh_topology().await;
+                continue;
+            };
+            if u32_to_shard_state(shard.state) == ShardState::UnderQuorum {
+                return Err(VektorError::QuorumUnavailable {
+                    shard_id,
+                    required: write_quorum,
+                    alive: 1,
+                });
+            }
+
+            match send_append_quorum(
+                &self.pool,
+                &shard.primary_addr,
+                shard_id,
+                shard.epoch,
+                true,
+                wire_records.clone(),
+                SEED_BATCH_TIMEOUT,
+            )
+            .await
+            {
+                Ok(resp) if resp.status_code == STATUS_OK => {
+                    return Ok(resp.assigned_seq_nos.len());
+                }
+                Ok(resp) if resp.status_code == STATUS_QUORUM_UNAVAILABLE => {
+                    return Err(VektorError::QuorumUnavailable {
+                        shard_id,
+                        required: write_quorum,
+                        alive: 1,
+                    });
+                }
+                Ok(resp) if resp.status_code == STATUS_WRONG_EPOCH && attempt == 0 => {
+                    let _ = self.refresh_topology().await;
+                }
+                Err(_) if attempt == 0 => {
+                    let _ = self.refresh_topology().await;
+                }
+                Ok(resp) => {
+                    return Err(VektorError::WalIo(resp.error_message));
+                }
+                Err(e) => {
+                    return Err(VektorError::WalIo(e));
+                }
+            }
+        }
+
+        Err(VektorError::WalIo(format!(
+            "upsert_batch failed after topology refresh on shard {shard_id}"
+        )))
+    }
+
     async fn append_single_quorum_record(
         &self,
         id: VectorId,
@@ -135,6 +342,7 @@ impl ClusterClient {
             }
 
             match send_append_quorum(
+                &self.pool,
                 &shard.primary_addr,
                 shard_id,
                 shard.epoch,
@@ -202,6 +410,7 @@ impl ClusterClient {
             .collect();
 
         let resp = send_append_quorum(
+            &self.pool,
             &shard.primary_addr,
             shard_id,
             shard.epoch,
@@ -239,11 +448,12 @@ impl ClusterClient {
 
         let mut tasks = Vec::with_capacity(topo.shards.len());
         for shard in topo.shards {
+            let pool = self.pool.clone();
             let q_bytes = query_bytes.clone();
             let k_u32 = top_k as u32;
             let ef_u32 = ef_search as u32;
             tasks.push(tokio::spawn(async move {
-                search_single_shard(shard, q_bytes, k_u32, ef_u32).await
+                search_single_shard(pool, shard, q_bytes, k_u32, ef_u32).await
             }));
         }
 
@@ -293,7 +503,7 @@ impl ClusterClient {
             if addr.is_empty() {
                 continue;
             }
-            if let Ok(wire_recs) = query_shard_wal(&addr, shard_id).await {
+            if let Ok(wire_recs) = query_shard_wal(&self.pool, &addr, shard_id).await {
                 for w in &wire_recs {
                     if let Ok(rec) = from_wire_wal_record(w, cfg.dimensions) {
                         by_seq.entry(rec.seq_no).or_insert(rec);
@@ -316,25 +526,37 @@ impl ClusterClient {
     }
 }
 
-async fn fetch_topology(coord_addr: &str) -> Result<GetTopologyResponse, VektorError> {
-    let endpoint = format_endpoint(coord_addr);
-    let mut client =
-        tokio::time::timeout(WRITE_QUORUM_TIMEOUT, TopologyRpcClient::connect(endpoint))
-            .await
-            .map_err(|_| VektorError::WalIo("coordinator connect timeout".to_string()))?
-            .map_err(|e| VektorError::WalIo(e.to_string()))?;
+async fn fetch_topology(
+    pool: &GrpcChannelPool,
+    coord_addr: &str,
+) -> Result<GetTopologyResponse, VektorError> {
+    let channel = pool
+        .get_or_connect(coord_addr, WRITE_QUORUM_TIMEOUT)
+        .await
+        .map_err(VektorError::WalIo)?;
+    let mut client = TopologyRpcClient::new(channel);
 
-    let resp = tokio::time::timeout(
+    let resp = match tokio::time::timeout(
         WRITE_QUORUM_TIMEOUT,
         client.get_topology(Request::new(GetTopologyRequest {})),
     )
     .await
-    .map_err(|_| VektorError::WalIo("get_topology timeout".to_string()))?
-    .map_err(|e| VektorError::WalIo(e.to_string()))?;
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            pool.evict(coord_addr);
+            return Err(VektorError::WalIo(e.to_string()));
+        }
+        Err(_) => {
+            pool.evict(coord_addr);
+            return Err(VektorError::WalIo("get_topology timeout".to_string()));
+        }
+    };
     Ok(resp.into_inner())
 }
 
 async fn send_append_quorum(
+    pool: &GrpcChannelPool,
     addr: &str,
     shard_id: ShardId,
     expected_epoch: u64,
@@ -342,13 +564,10 @@ async fn send_append_quorum(
     records: Vec<WireWalRecord>,
     timeout: Duration,
 ) -> Result<vektordist_proto::v1::AppendQuorumResponse, String> {
-    let endpoint = format_endpoint(addr);
-    let mut client = tokio::time::timeout(timeout, ShardReplicaRpcClient::connect(endpoint))
-        .await
-        .map_err(|_| "connect timeout".to_string())?
-        .map_err(|e| e.to_string())?;
+    let channel = pool.get_or_connect(addr, timeout).await?;
+    let mut client = ShardReplicaRpcClient::new(channel);
 
-    let resp = tokio::time::timeout(
+    match tokio::time::timeout(
         timeout,
         client.append_quorum(Request::new(AppendQuorumRequest {
             shard_id,
@@ -358,12 +577,21 @@ async fn send_append_quorum(
         })),
     )
     .await
-    .map_err(|_| "append_quorum timeout".to_string())?
-    .map_err(|e| e.to_string())?;
-    Ok(resp.into_inner())
+    {
+        Ok(Ok(resp)) => Ok(resp.into_inner()),
+        Ok(Err(e)) => {
+            pool.evict(addr);
+            Err(e.to_string())
+        }
+        Err(_) => {
+            pool.evict(addr);
+            Err("append_quorum timeout".to_string())
+        }
+    }
 }
 
 async fn search_single_shard(
+    pool: GrpcChannelPool,
     shard: WireShardAssignment,
     query_f32_le: Vec<u8>,
     top_k: u32,
@@ -391,6 +619,7 @@ async fn search_single_shard(
 
     for addr in candidates {
         match rpc_search_shard(
+            &pool,
             &addr,
             shard.shard_id,
             shard.epoch,
@@ -415,6 +644,7 @@ async fn search_single_shard(
 }
 
 async fn rpc_search_shard(
+    pool: &GrpcChannelPool,
     addr: &str,
     shard_id: ShardId,
     expected_epoch: u64,
@@ -422,16 +652,10 @@ async fn rpc_search_shard(
     ef_search: u32,
     query_f32_le: Vec<u8>,
 ) -> Result<Vec<ScoredId>, String> {
-    let endpoint = format_endpoint(addr);
-    let mut client = tokio::time::timeout(
-        SEARCH_SHARD_TIMEOUT,
-        ShardReplicaRpcClient::connect(endpoint),
-    )
-    .await
-    .map_err(|_| "search connect timeout".to_string())?
-    .map_err(|e| e.to_string())?;
+    let channel = pool.get_or_connect(addr, SEARCH_SHARD_TIMEOUT).await?;
+    let mut client = ShardReplicaRpcClient::new(channel);
 
-    let resp = tokio::time::timeout(
+    let resp = match tokio::time::timeout(
         SEARCH_SHARD_TIMEOUT,
         client.search_shard(Request::new(SearchShardRequest {
             shard_id,
@@ -442,9 +666,17 @@ async fn rpc_search_shard(
         })),
     )
     .await
-    .map_err(|_| "search_shard timeout".to_string())?
-    .map_err(|e| e.to_string())?
-    .into_inner();
+    {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(e)) => {
+            pool.evict(addr);
+            return Err(e.to_string());
+        }
+        Err(_) => {
+            pool.evict(addr);
+            return Err("search_shard timeout".to_string());
+        }
+    };
 
     if resp.status_code == STATUS_OK {
         Ok(resp.hits.iter().map(from_wire_scored_id).collect())
@@ -453,17 +685,15 @@ async fn rpc_search_shard(
     }
 }
 
-async fn query_shard_wal(addr: &str, shard_id: ShardId) -> Result<Vec<WireWalRecord>, String> {
-    let endpoint = format_endpoint(addr);
-    let mut client = tokio::time::timeout(
-        WRITE_QUORUM_TIMEOUT,
-        ShardReplicaRpcClient::connect(endpoint),
-    )
-    .await
-    .map_err(|_| "wal query connect timeout".to_string())?
-    .map_err(|e| e.to_string())?;
+async fn query_shard_wal(
+    pool: &GrpcChannelPool,
+    addr: &str,
+    shard_id: ShardId,
+) -> Result<Vec<WireWalRecord>, String> {
+    let channel = pool.get_or_connect(addr, WRITE_QUORUM_TIMEOUT).await?;
+    let mut client = ShardReplicaRpcClient::new(channel);
 
-    let resp = tokio::time::timeout(
+    let resp = match tokio::time::timeout(
         WRITE_QUORUM_TIMEOUT,
         client.get_wal_records(Request::new(GetWalRecordsRequest {
             shard_id,
@@ -471,8 +701,16 @@ async fn query_shard_wal(addr: &str, shard_id: ShardId) -> Result<Vec<WireWalRec
         })),
     )
     .await
-    .map_err(|_| "get_wal_records timeout".to_string())?
-    .map_err(|e| e.to_string())?
-    .into_inner();
+    {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(e)) => {
+            pool.evict(addr);
+            return Err(e.to_string());
+        }
+        Err(_) => {
+            pool.evict(addr);
+            return Err("get_wal_records timeout".to_string());
+        }
+    };
     Ok(resp.records)
 }

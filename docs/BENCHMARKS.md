@@ -57,6 +57,20 @@ Measured via `cargo run --release -- bench --vectors 3000 --dimensions 768 --que
 | **`BqIndex` (`1-bit` POPCNT + `10x` Rerank, M7)** | `281.2 KiB` (`96 B/vec`) | **`32.0x` payload** | **`0.08 ms`** | **`0.11 ms`** | **`100.00%`** |
 | **`AdaptiveSearchController` (M6)** | Shared `HnswIndex` | `1.0x` | `0.18 ms` | `0.30 ms` | **`100.00%`** |
 
+### M15 Million-Vector Streaming Scale Benchmark (`1,000,000 x 768d`, `BQ` `32x` + `32x` Oversample Rerank)
+
+Measured via `cargo run --release -- bench-scale --vectors 1000000 --dimensions 768 --queries 20`:
+
+| Metric | Measured Result (`Apple M5`, `--release`) |
+| --- | --- |
+| **Dataset Scale** | **`1,000,000` vectors x `768` dimensions** |
+| **Uncompressed `f32` Equivalent** | `2,929.69 MiB` (`3,072,000,000` bytes) |
+| **`BqIndex` Packed Payload (`96 B/vec`)** | **`91.55 MiB`** (**`32.0x` exact compression**, `127.30 MiB` total arena) |
+| **Streaming Build Time** | **`3.56 s`** (`~280,898` vectors/sec) |
+| **Query Latency (`p50` / `p95`)** | **`3.05 ms` / `3.88 ms`** (`<= 50.0 ms` target by **12.8x**) |
+| **Hardware `XOR + POPCNT` Scan Throughput** | **`328.3 Million Vectors/sec`** |
+| **Measured `Recall@10` vs Exact Cosine** | **`100.00%`** |
+
 ### M10 Automated 5-Node Chaos SLA Campaign (`vektordist chaos --nodes 5 --vectors 800 --dimensions 128`)
 
 - **Schedule:** `SeedVectors(800)` -> `ConcurrentWorkload(writes=120, reads=40)` -> `KillNode(node_id=2)` -> `VerifyZeroWriteLoss` -> `AddReplacementNode(node_id=6)` -> `VerifyZeroWriteLoss` -> `AssertRecallAndLatencySla`
@@ -66,18 +80,21 @@ Measured via `cargo run --release -- bench --vectors 3000 --dimensions 768 --que
 
 ## 5. Reproduction Commands
 
-Run the full M1–M10 verification and benchmark suite:
+Run the full M1–M15 verification and benchmark suite:
 
 ```bash
-# 1. Run the M1-M10 768d release benchmark suite across Exact, HNSW, SQ8 (4x), BQ (32x), and Adaptive M6:
+# 1. Run preflight host, SIMD, WAL fsync, and network diagnostics:
+cargo run --release -- doctor
+
+# 2. Run the 1,000,000 x 768d streaming Binary Quantization (32x) scale benchmark (~127 MiB RAM):
+cargo run --release -- bench-scale --vectors 1000000 --dimensions 768 --queries 20
+
+# 3. Run the M1-M10 768d release benchmark suite across Exact, HNSW, SQ8 (4x), BQ (32x), and Adaptive M6:
 cargo run --release -- bench --vectors 3000 --dimensions 768 --queries 20
 
-# 2. Run the M10 automated 5-node fault-injection & zero-write-loss SLA campaign:
+# 4. Run the M10 automated 5-node fault-injection & zero-write-loss SLA campaign:
 cargo run --release -- chaos --nodes 5 --vectors 800 --dimensions 128
 
-# 3. Verify SIMD vs scalar parity, SQ8 4x compression, BQ 32x / PQ 16x + LSM compaction, and VDSG CRC32 integrity:
-cargo test -p vektordist-core --release --test m3_quant_mmap --test m7_pq_bq_compaction -- --nocapture
-
-# 4. Run the full workspace test suite (56 unit & integration tests across M1-M10) and strict Clippy lints:
+# 5. Run the full workspace test suite (68 unit & integration tests across M1-M15) and strict Clippy lints:
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```

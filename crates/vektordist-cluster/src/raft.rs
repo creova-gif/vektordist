@@ -56,6 +56,21 @@ pub enum TopologyCommand {
     RegisterNode { node_id: NodeId, addr: String },
     /// Mark a data-plane node offline in the topology.
     RemoveNode { node_id: NodeId },
+    /// Replicate or rotate a tenant-scoped API key record across the cluster control plane.
+    UpsertApiKey {
+        record: crate::security::ScopedApiKey,
+    },
+    /// Immediately revoke an API key cluster-wide across all synchronized gateways.
+    RevokeApiKey { key_id: String },
+    /// Configure cluster-wide rate limit and storage quota policy for `org_id`
+    /// (`max_qps = max_qps_milli as f64 / 1000.0`, `burst_capacity = burst_milli as f64 / 1000.0`).
+    SetTenantQuota {
+        org_id: crate::security::OrgId,
+        max_qps_milli: u64,
+        burst_milli: u64,
+        max_vectors: u64,
+        max_memory_bytes: u64,
+    },
 }
 
 /// Single entry in the replicated Raft topology log.
@@ -137,6 +152,9 @@ pub struct RaftNode {
     pub snapshot: TopologySnapshot,
     pub node_addrs: BTreeMap<NodeId, String>,
     pub alive_nodes: BTreeSet<NodeId>,
+    pub api_keys: BTreeMap<String, crate::security::ScopedApiKey>,
+    pub revoked_keys: BTreeSet<String>,
+    pub tenant_quotas: BTreeMap<crate::security::OrgId, crate::security::TenantQuotaPolicy>,
 }
 
 impl RaftNode {
@@ -166,6 +184,9 @@ impl RaftNode {
             snapshot: initial_snapshot,
             node_addrs: BTreeMap::new(),
             alive_nodes,
+            api_keys: BTreeMap::new(),
+            revoked_keys: BTreeSet::new(),
+            tenant_quotas: BTreeMap::new(),
         }
     }
 
@@ -458,6 +479,35 @@ impl RaftNode {
             }
             TopologyCommand::RemoveNode { node_id } => {
                 self.alive_nodes.remove(node_id);
+            }
+            TopologyCommand::UpsertApiKey { record } => {
+                if record.revoked {
+                    self.revoked_keys.insert(record.key_id.clone());
+                } else {
+                    self.revoked_keys.remove(&record.key_id);
+                }
+                self.api_keys.insert(record.key_id.clone(), record.clone());
+            }
+            TopologyCommand::RevokeApiKey { key_id } => {
+                self.revoked_keys.insert(key_id.clone());
+                if let Some(existing) = self.api_keys.get_mut(key_id) {
+                    existing.revoked = true;
+                }
+            }
+            TopologyCommand::SetTenantQuota {
+                org_id,
+                max_qps_milli,
+                burst_milli,
+                max_vectors,
+                max_memory_bytes,
+            } => {
+                let policy = crate::security::TenantQuotaPolicy {
+                    max_qps: (*max_qps_milli as f64) / 1000.0,
+                    burst_capacity: (*burst_milli as f64) / 1000.0,
+                    max_vectors: *max_vectors,
+                    max_memory_bytes: *max_memory_bytes,
+                };
+                self.tenant_quotas.insert(org_id.clone(), policy);
             }
         }
     }
