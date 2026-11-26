@@ -6,6 +6,7 @@ pub mod agentic;
 pub mod arena;
 pub mod checkpoint;
 pub mod exact;
+pub mod fp16;
 pub mod hnsw;
 pub mod hybrid;
 pub mod mmap;

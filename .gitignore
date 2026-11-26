@@ -2,6 +2,12 @@
 /target
 **/*.rs.bk
 
+# Python SDK caches
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+
 # Release packaging & temporary directories
 /dist/
 /tmp/

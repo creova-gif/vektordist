@@ -1,0 +1,206 @@
+# Turnkey local VektorDist distributed cluster + Prometheus observability stack.
+# Usage (from repository root):
+#   docker compose -f deploy/docker-compose.yml up --build -d
+
+name: vektordist
+
+services:
+  coord:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: vektordist:0.3.0
+    container_name: vektordist-coord
+    command: ["coord", "--listen", "0.0.0.0:50051"]
+    expose:
+      - "50051"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    networks:
+      - vektordist-net
+
+  node-1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: vektordist:0.3.0
+    container_name: vektordist-node-1
+    command:
+      - "node"
+      - "--id"
+      - "1"
+      - "--listen"
+      - "0.0.0.0:50052"
+      - "--data-dir"
+      - "/var/lib/vektordist/data"
+      - "--dimensions"
+      - "768"
+      - "--num-shards"
+      - "16"
+      - "--write-quorum"
+      - "2"
+    environment:
+      VEKTORDIST_COORD_ADDR: "coord:50051"
+    expose:
+      - "50052"
+    volumes:
+      - node_1_data:/var/lib/vektordist/data
+    depends_on:
+      - coord
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    networks:
+      - vektordist-net
+
+  node-2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: vektordist:0.3.0
+    container_name: vektordist-node-2
+    command:
+      - "node"
+      - "--id"
+      - "2"
+      - "--listen"
+      - "0.0.0.0:50052"
+      - "--data-dir"
+      - "/var/lib/vektordist/data"
+      - "--dimensions"
+      - "768"
+      - "--num-shards"
+      - "16"
+      - "--write-quorum"
+      - "2"
+    environment:
+      VEKTORDIST_COORD_ADDR: "coord:50051"
+    expose:
+      - "50052"
+    volumes:
+      - node_2_data:/var/lib/vektordist/data
+    depends_on:
+      - coord
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    networks:
+      - vektordist-net
+
+  node-3:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: vektordist:0.3.0
+    container_name: vektordist-node-3
+    command:
+      - "node"
+      - "--id"
+      - "3"
+      - "--listen"
+      - "0.0.0.0:50052"
+      - "--data-dir"
+      - "/var/lib/vektordist/data"
+      - "--dimensions"
+      - "768"
+      - "--num-shards"
+      - "16"
+      - "--write-quorum"
+      - "2"
+    environment:
+      VEKTORDIST_COORD_ADDR: "coord:50051"
+    expose:
+      - "50052"
+    volumes:
+      - node_3_data:/var/lib/vektordist/data
+    depends_on:
+      - coord
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    networks:
+      - vektordist-net
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: vektordist:0.3.0
+    container_name: vektordist-gateway
+    command:
+      - "gateway"
+      - "--coord"
+      - "coord:50051"
+      - "--listen"
+      - "0.0.0.0:8080"
+    environment:
+      VEKTORDIST_MASTER_SECRET: "${VEKTORDIST_MASTER_SECRET:-}"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - coord
+      - node-1
+      - node-2
+      - node-3
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/readyz >/dev/null 2>&1 || curl -fsS http://127.0.0.1:8080/readyz >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 5s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    networks:
+      - vektordist-net
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: vektordist-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - gateway
+    restart: unless-stopped
+    networks:
+      - vektordist-net
+
+volumes:
+  node_1_data:
+  node_2_data:
+  node_3_data:
+  prometheus_data:
+
+networks:
+  vektordist-net:
+    driver: bridge

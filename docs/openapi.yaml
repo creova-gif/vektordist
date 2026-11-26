@@ -1,0 +1,900 @@
+openapi: 3.1.0
+info:
+  title: VektorDist HTTP/1.1 REST & Observability Gateway API
+  version: 0.3.0
+  summary: Distributed sharded HNSW vector search engine with quorum WAL durability and multi-collection management.
+  description: |
+    Zero-trust HTTP/1.1 REST, multi-collection management, and Prometheus observability
+    specification for **VektorDist**.
+
+    ### Authentication, Multi-Tenancy & Distributed Tracing
+    - **Bearer Auth (`BearerAuth`):** Scoped `vdk.<key_id>.<hex_tag>` tokens verified in
+      constant time by `SecurityGate` with monotonic RBAC roles (`Reader`, `Writer`, `Admin`).
+    - **Tenant Isolation (`X-Org-Id`):** Enforces structural per-organization isolation and
+      token-bucket rate quotas (`429 Too Many Requests` with `Retry-After`).
+    - **W3C Trace Context (`traceparent`):** Accepts `00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>`,
+      spawns child spans, and returns `traceparent` + `x-trace-id` on every response.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local VektorDist HTTP/1.1 gateway
+
+tags:
+  - name: Observability
+    description: Liveness, Kubernetes quorum readiness, Prometheus metrics, and OpenAPI schema discovery.
+  - name: Vectors
+    description: Quorum-durable (`W=2` of `RF=3`) sharded vector mutations and distributed scatter-gather search.
+  - name: Cluster & Security
+    description: Topology inspection and cryptographic hash-chained audit verification.
+  - name: Collections
+    description: Named multi-collection lifecycle (`f32`, `fp16`, `sq8`, `bq`) and collection-scoped vector operations.
+
+paths:
+  /healthz:
+    get:
+      tags: [Observability]
+      operationId: getHealthz
+      summary: Process liveness and node telemetry probe
+      parameters:
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Gateway process is alive.
+          headers:
+            x-trace-id:
+              $ref: "#/components/headers/XTraceId"
+            traceparent:
+              $ref: "#/components/headers/Traceparent"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthzResponse"
+
+  /readyz:
+    get:
+      tags: [Observability]
+      operationId: getReadyz
+      summary: Kubernetes readiness and quorum availability probe
+      parameters:
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Gateway is not draining and all shards satisfy quorum readiness.
+          headers:
+            x-trace-id:
+              $ref: "#/components/headers/XTraceId"
+            traceparent:
+              $ref: "#/components/headers/Traceparent"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyzResponse"
+        "503":
+          description: Gateway is draining or cluster has zero active nodes / under-quorum shards.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyzResponse"
+
+  /metrics:
+    get:
+      tags: [Observability]
+      operationId: getPrometheusMetrics
+      summary: Prometheus text exposition (`0.0.4`) telemetry endpoint
+      parameters:
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Prometheus metrics payload.
+          content:
+            "text/plain; version=0.0.4; charset=utf-8":
+              schema:
+                type: string
+
+  /openapi.json:
+    get:
+      tags: [Observability]
+      operationId: getOpenApiSpec
+      summary: Live OpenAPI 3.1.0 JSON schema discovery
+      parameters:
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: OpenAPI 3.1 JSON document describing gateway routes and schemas.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /v1/upsert:
+    post:
+      tags: [Vectors]
+      operationId: upsertVector
+      summary: Quorum-durable single vector upsert (`Writer` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertRequest"
+      responses:
+        "200":
+          description: Vector durably committed to shard WAL quorum.
+          headers:
+            x-trace-id:
+              $ref: "#/components/headers/XTraceId"
+            traceparent:
+              $ref: "#/components/headers/Traceparent"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpsertAckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "408":
+          $ref: "#/components/responses/RequestTimeoutError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeError"
+        "429":
+          $ref: "#/components/responses/RateLimitedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+
+  /v1/upsert_batch:
+    post:
+      tags: [Vectors]
+      operationId: upsertVectorBatch
+      summary: Shard-grouped quorum bulk vector upsert (`Writer` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertBatchRequest"
+      responses:
+        "200":
+          description: All batch records durably committed across shard primaries.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpsertBatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeError"
+        "429":
+          $ref: "#/components/responses/RateLimitedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+
+  /v1/search:
+    post:
+      tags: [Vectors]
+      operationId: searchVectors
+      summary: Distributed scatter-gather top-k HNSW search (`Reader` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Ranked nearest-neighbor search hits.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "413":
+          $ref: "#/components/responses/PayloadTooLargeError"
+        "429":
+          $ref: "#/components/responses/RateLimitedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+
+  /v1/delete:
+    post:
+      tags: [Vectors]
+      operationId: deleteVector
+      summary: Quorum-durable vector tombstone delete (`Writer` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteRequest"
+      responses:
+        "200":
+          description: Tombstone durably committed to shard WAL quorum.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpsertAckResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitedError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailableError"
+
+  /v1/topology:
+    get:
+      tags: [Cluster & Security]
+      operationId: getTopology
+      summary: Inspect live cluster epoch, shard count, quorum, and active nodes (`Reader` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Cluster topology summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TopologyResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "429":
+          $ref: "#/components/responses/RateLimitedError"
+
+  /v1/audit:
+    get:
+      tags: [Cluster & Security]
+      operationId: getAuditReport
+      summary: Verify hash-chained security audit log integrity (`Admin` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Cryptographic audit chain integrity verification report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "500":
+          description: Audit log hash-chain tamper violation detected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/collections:
+    get:
+      tags: [Collections]
+      operationId: listCollections
+      summary: List all registered vector collections (`Reader` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Registered collections and per-collection configurations.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListCollectionsResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+    post:
+      tags: [Collections]
+      operationId: createCollection
+      summary: Create an isolated named vector collection (`Writer` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCollectionRequest"
+      responses:
+        "200":
+          description: Collection created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionMutationResponse"
+        "201":
+          description: Collection created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionMutationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "409":
+          description: Collection with the same name already exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/collections/{name}:
+    parameters:
+      - $ref: "#/components/parameters/CollectionNamePath"
+      - $ref: "#/components/parameters/XOrgIdHeader"
+      - $ref: "#/components/parameters/TraceparentHeader"
+    get:
+      tags: [Collections]
+      operationId: getCollection
+      summary: Retrieve metadata and live vector statistics for a collection (`Reader` role)
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Collection descriptor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionDetailResponse"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+    delete:
+      tags: [Collections]
+      operationId: dropCollection
+      summary: Drop a named vector collection and reclaim memory (`Writer` role)
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Collection dropped.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionMutationResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /v1/collections/{name}/upsert:
+    post:
+      tags: [Collections]
+      operationId: collectionUpsert
+      summary: Upsert a vector into a named collection (`Writer` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CollectionNamePath"
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertRequest"
+      responses:
+        "200":
+          description: Vector indexed into named collection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionMutationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /v1/collections/{name}/search:
+    post:
+      tags: [Collections]
+      operationId: collectionSearch
+      summary: Search top-k nearest neighbors within a named collection (`Reader` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CollectionNamePath"
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Ranked collection search hits.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /v1/collections/{name}/delete:
+    post:
+      tags: [Collections]
+      operationId: collectionDelete
+      summary: Delete a vector by ID from a named collection (`Writer` role)
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CollectionNamePath"
+        - $ref: "#/components/parameters/XOrgIdHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteRequest"
+      responses:
+        "200":
+          description: Vector deleted from collection.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CollectionMutationResponse"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: vdk.<key_id>.<hex_tag>
+      description: "Constant-time verified VektorDist zero-trust API key (`Authorization: Bearer vdk...`)."
+
+  parameters:
+    CollectionNamePath:
+      name: name
+      in: path
+      required: true
+      description: Unique alphanumeric/underscore/hyphen collection identifier.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    XOrgIdHeader:
+      name: X-Org-Id
+      in: header
+      required: false
+      description: Tenant organization identifier (defaults to `default`).
+      schema:
+        type: string
+        default: default
+    TraceparentHeader:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context v00 header (`00-<32hex>-<16hex>-<2hex>`).
+      schema:
+        type: string
+        pattern: "^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+
+  headers:
+    XTraceId:
+      description: 32-hex distributed trace identifier correlated across gateway and shard spans.
+      schema:
+        type: string
+    Traceparent:
+      description: Propagated child W3C `traceparent` span header.
+      schema:
+        type: string
+
+  responses:
+    BadRequestError:
+      description: Malformed JSON payload, invalid header, or vector dimension mismatch.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnauthorizedError:
+      description: Missing, invalid, or revoked bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ForbiddenError:
+      description: Cross-tenant `X-Org-Id` violation or insufficient RBAC role.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFoundError:
+      description: Route or named collection does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RequestTimeoutError:
+      description: Slowloris header/body read timeout (`408 Request Timeout`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    PayloadTooLargeError:
+      description: HTTP request body exceeds gateway `max_body_bytes` cap (`413 Payload Too Large`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RateLimitedError:
+      description: Per-tenant QPS rate quota exceeded (`429 Too Many Requests`).
+      headers:
+        Retry-After:
+          description: Recommended backoff duration in seconds before retrying.
+          schema:
+            type: integer
+            minimum: 0
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RateLimitErrorResponse"
+    ServiceUnavailableError:
+      description: Upstream shard quorum unavailable or gateway concurrency limit saturated.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    HealthzResponse:
+      type: object
+      required: [status, active_nodes, configured_nodes, acked_writes_lost]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        active_nodes:
+          type: integer
+          minimum: 0
+        configured_nodes:
+          type: integer
+          minimum: 0
+        acked_writes_lost:
+          type: integer
+          minimum: 0
+
+    ReadyzResponse:
+      type: object
+      required: [status, draining, active_nodes, under_quorum_shards]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        draining:
+          type: boolean
+        active_nodes:
+          type: integer
+          minimum: 0
+        under_quorum_shards:
+          type: integer
+          minimum: 0
+
+    UpsertRequest:
+      type: object
+      required: [id, vector]
+      properties:
+        id:
+          type: integer
+          minimum: 0
+        write_id:
+          type: integer
+          minimum: 0
+          description: Idempotency write identifier (defaults to `id` if omitted).
+        vector:
+          type: array
+          minItems: 1
+          items:
+            type: number
+
+    UpsertAckResponse:
+      type: object
+      required: [status, shard_id, seq_no, trace_id]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        shard_id:
+          type: integer
+          minimum: 0
+        seq_no:
+          type: integer
+          minimum: 0
+        trace_id:
+          type: string
+
+    UpsertBatchRequest:
+      type: object
+      required: [records]
+      properties:
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/UpsertRequest"
+
+    UpsertBatchResponse:
+      type: object
+      required: [status, upserted, trace_id]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        upserted:
+          type: integer
+          minimum: 0
+        trace_id:
+          type: string
+
+    SearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: array
+          minItems: 1
+          items:
+            type: number
+        top_k:
+          type: integer
+          minimum: 1
+          default: 10
+        ef_search:
+          type: integer
+          minimum: 1
+          default: 64
+
+    ScoredHit:
+      type: object
+      required: [id, score]
+      properties:
+        id:
+          type: integer
+          minimum: 0
+        score:
+          type: number
+
+    SearchResponse:
+      type: object
+      required: [status, hits, trace_id]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredHit"
+        trace_id:
+          type: string
+
+    DeleteRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: integer
+          minimum: 0
+        write_id:
+          type: integer
+          minimum: 0
+
+    TopologyResponse:
+      type: object
+      required:
+        - status
+        - epoch
+        - num_shards
+        - replication_factor
+        - write_quorum
+        - dimensions
+        - configured_nodes
+        - active_nodes
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        epoch:
+          type: integer
+          minimum: 0
+        num_shards:
+          type: integer
+          minimum: 1
+        replication_factor:
+          type: integer
+          minimum: 1
+        write_quorum:
+          type: integer
+          minimum: 1
+        dimensions:
+          type: integer
+          minimum: 1
+        configured_nodes:
+          type: integer
+          minimum: 0
+        active_nodes:
+          type: integer
+          minimum: 0
+
+    AuditResponse:
+      type: object
+      required: [status, security_enabled, entries_count, head_hash, chain_valid]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        security_enabled:
+          type: boolean
+        entries_count:
+          type: integer
+          minimum: 0
+        head_hash:
+          type: integer
+          minimum: 0
+        chain_valid:
+          type: boolean
+
+    CreateCollectionRequest:
+      type: object
+      required: [name, dimensions]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        dimensions:
+          type: integer
+          minimum: 1
+        metric:
+          type: string
+          enum: [cosine, l2]
+          default: cosine
+        quantization:
+          type: string
+          enum: [f32, fp16, sq8, bq]
+          default: f32
+
+    CollectionInfo:
+      type: object
+      required: [name, dimensions, metric, quantization]
+      properties:
+        name:
+          type: string
+        dimensions:
+          type: integer
+          minimum: 1
+        metric:
+          type: string
+          enum: [cosine, l2]
+        quantization:
+          type: string
+          enum: [f32, fp16, sq8, bq]
+        live_vectors:
+          type: integer
+          minimum: 0
+
+    ListCollectionsResponse:
+      type: object
+      required: [status, collections]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        collections:
+          type: array
+          items:
+            $ref: "#/components/schemas/CollectionInfo"
+        trace_id:
+          type: string
+
+    CollectionDetailResponse:
+      type: object
+      required: [status, collection]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        collection:
+          $ref: "#/components/schemas/CollectionInfo"
+        trace_id:
+          type: string
+
+    CollectionMutationResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        trace_id:
+          type: string
+      additionalProperties: true
+
+    ErrorResponse:
+      type: object
+      required: [status, error]
+      properties:
+        status:
+          type: string
+          enum: [error]
+        error:
+          type: string
+        trace_id:
+          type: string
+
+    RateLimitErrorResponse:
+      type: object
+      required: [status, error, retry_after_ms]
+      properties:
+        status:
+          type: string
+          enum: [error]
+        error:
+          type: string
+        retry_after_ms:
+          type: integer
+          minimum: 0
+        trace_id:
+          type: string

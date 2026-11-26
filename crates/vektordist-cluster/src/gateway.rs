@@ -1,263 +1,41 @@
-//! Milestone 10 & 11: Zero-Trust HTTP/1.1 REST & Prometheus `/metrics` Gateway, Quorum REST
-//! Delete, W3C `traceparent` Distributed Trace Spans, Tamper-Evident Audit Verification, and
-//! Automated Chaos Campaign Runner.
-//!
-//! Built directly on `tokio::net::TcpListener` without external HTTP framework dependencies.
+//! Zero-Trust HTTP/1.1 REST, Prometheus `/metrics`, OpenAPI `3.1.0` `/openapi.json`, and
+//! Multi-Collection Namespace Gateway built directly on `tokio::net::TcpListener` with bounded
+//! concurrency (`Semaphore`), Slowloris read timeouts (`408`), and bounded latency histograms.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tonic::transport::Server;
-use vektordist_core::exact::{ExactIndex, SeededRng};
-use vektordist_core::hnsw::HnswParams;
-use vektordist_core::{ClusterConfig, NodeId, ShardId, VectorId, VektorError, WriteId};
-use vektordist_proto::v1::shard_replica_rpc_server::ShardReplicaRpcServer;
-use vektordist_proto::v1::topology_rpc_server::TopologyRpcServer;
+use vektordist_core::VektorError;
 
 use crate::client::ClusterClient;
-use crate::coord::CoordinatorService;
-use crate::node::NodeService;
+use crate::collections::CollectionRegistry;
 use crate::security::{OrgId, SecurityError, SecurityGate, TenantRole};
+use crate::telemetry::{
+    build_http_response, build_http_response_with_headers, escape_json_str, extract_json_f32_array,
+    extract_json_u64, extract_json_upsert_batch, format_hits_json, openapi_spec_json,
+    parse_http_response, split_http_head_and_body,
+};
 
-static TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
-static CHAOS_DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
+pub use crate::chaos::{ChaosCampaign, ChaosCampaignReport, ChaosStep};
+pub use crate::telemetry::{BoundedLatencyWindow, PrometheusMetrics, TraceSpan};
 
 /// Default maximum HTTP request payload size (`16 MiB`) enforced before parsing JSON bodies.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// Live cluster & gateway telemetry exported in Prometheus text exposition format (`0.0.4`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct PrometheusMetrics {
-    pub active_nodes: u32,
-    pub configured_nodes: u32,
-    pub indexed_vectors: u64,
-    pub search_latency_p50_ms: f64,
-    pub search_latency_p95_ms: f64,
-    pub search_latency_p99_ms: f64,
-    pub recall_at_10: f64,
-    pub acked_writes_total: u64,
-    pub acked_writes_lost_total: u64,
-}
+/// Default per-connection HTTP request read timeout (`5s`) protecting against Slowloris stalls.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-impl Default for PrometheusMetrics {
-    fn default() -> Self {
-        Self {
-            active_nodes: 0,
-            configured_nodes: 0,
-            indexed_vectors: 0,
-            search_latency_p50_ms: 0.0,
-            search_latency_p95_ms: 0.0,
-            search_latency_p99_ms: 0.0,
-            recall_at_10: 1.0,
-            acked_writes_total: 0,
-            acked_writes_lost_total: 0,
-        }
-    }
-}
+/// Default maximum concurrent in-flight TCP connections accepted by [`spawn_http_gateway`].
+pub const DEFAULT_MAX_CONNECTIONS: usize = 512;
 
-impl PrometheusMetrics {
-    /// Format all cluster metrics into standard Prometheus `text/plain; version=0.0.4` format.
-    #[must_use]
-    pub fn render_prometheus_text(&self) -> String {
-        let mut out = String::with_capacity(1024);
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_active_nodes Number of currently alive physical cluster nodes."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_active_nodes gauge");
-        let _ = writeln!(out, "vektordist_active_nodes {}", self.active_nodes);
-
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_configured_nodes Total number of registered physical cluster nodes."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_configured_nodes gauge");
-        let _ = writeln!(out, "vektordist_configured_nodes {}", self.configured_nodes);
-
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_indexed_vectors Total live vectors indexed across active replicas."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_indexed_vectors gauge");
-        let _ = writeln!(out, "vektordist_indexed_vectors {}", self.indexed_vectors);
-
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_search_latency_p50_ms 50th percentile scatter-gather search latency in milliseconds."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_search_latency_p50_ms gauge");
-        let _ = writeln!(
-            out,
-            "vektordist_search_latency_p50_ms {:.4}",
-            self.search_latency_p50_ms
-        );
-
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_search_latency_p95_ms 95th percentile scatter-gather search latency in milliseconds."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_search_latency_p95_ms gauge");
-        let _ = writeln!(
-            out,
-            "vektordist_search_latency_p95_ms {:.4}",
-            self.search_latency_p95_ms
-        );
-
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_search_latency_p99_ms 99th percentile scatter-gather search latency in milliseconds."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_search_latency_p99_ms gauge");
-        let _ = writeln!(
-            out,
-            "vektordist_search_latency_p99_ms {:.4}",
-            self.search_latency_p99_ms
-        );
-
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_recall_at_10 Measured top-10 recall against exact brute-force ground truth."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_recall_at_10 gauge");
-        let _ = writeln!(out, "vektordist_recall_at_10 {:.4}", self.recall_at_10);
-
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_acked_writes_total Total W=2 quorum-acknowledged vector writes."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_acked_writes_total counter");
-        let _ = writeln!(
-            out,
-            "vektordist_acked_writes_total {}",
-            self.acked_writes_total
-        );
-
-        let _ = writeln!(
-            out,
-            "# HELP vektordist_acked_writes_lost_total Total quorum-acknowledged writes lost across failovers."
-        );
-        let _ = writeln!(out, "# TYPE vektordist_acked_writes_lost_total counter");
-        let _ = writeln!(
-            out,
-            "vektordist_acked_writes_lost_total {}",
-            self.acked_writes_lost_total
-        );
-        out
-    }
-}
-
-/// W3C Trace Context (`traceparent` version `00`) span representation:
-/// `00-<32-hex trace_id>-<16-hex span_id>-<2-hex trace_flags>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraceSpan {
-    pub version: u8,
-    pub trace_id: String,
-    pub span_id: String,
-    pub parent_span_id: Option<String>,
-    pub sampled: bool,
-}
-
-impl TraceSpan {
-    /// Generate a fresh root `TraceSpan` with deterministic-friendly SplitMix64 entropy.
-    #[must_use]
-    pub fn generate() -> Self {
-        let seq = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self::new_root(seq)
-    }
-
-    /// Create a root `TraceSpan` seeded by `seed`.
-    #[must_use]
-    pub fn new_root(seed: u64) -> Self {
-        let mut rng = SeededRng::new(seed ^ 0x517c_c1b7_2722_0a95);
-        let hi = rng.next_u64().max(1);
-        let lo = rng.next_u64().max(1);
-        let span = rng.next_u64().max(1);
-        Self {
-            version: 0,
-            trace_id: format!("{hi:016x}{lo:016x}"),
-            span_id: format!("{span:016x}"),
-            parent_span_id: None,
-            sampled: true,
-        }
-    }
-
-    /// Parse a W3C `traceparent` header (`00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>`).
-    pub fn parse_traceparent(header: &str) -> Result<Self, VektorError> {
-        let trimmed = header.trim();
-        let parts: Vec<&str> = trimmed.split('-').collect();
-        if parts.len() != 4 {
-            return Err(VektorError::InvalidConfig(
-                "traceparent must have 4 dash-separated fields",
-            ));
-        }
-        if parts[0] != "00" {
-            return Err(VektorError::InvalidConfig(
-                "unsupported traceparent version",
-            ));
-        }
-        let trace_id = parts[1].to_ascii_lowercase();
-        if trace_id.len() != 32
-            || !trace_id.bytes().all(|b| b.is_ascii_hexdigit())
-            || trace_id.bytes().all(|b| b == b'0')
-        {
-            return Err(VektorError::InvalidConfig("invalid 32-hex trace_id"));
-        }
-        let span_id = parts[2].to_ascii_lowercase();
-        if span_id.len() != 16
-            || !span_id.bytes().all(|b| b.is_ascii_hexdigit())
-            || span_id.bytes().all(|b| b == b'0')
-        {
-            return Err(VektorError::InvalidConfig("invalid 16-hex span_id"));
-        }
-        let flags_str = parts[3];
-        if flags_str.len() != 2 || !flags_str.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(VektorError::InvalidConfig("invalid 2-hex trace_flags"));
-        }
-        let flags = u8::from_str_radix(flags_str, 16)
-            .map_err(|_| VektorError::InvalidConfig("invalid trace_flags hex"))?;
-        Ok(Self {
-            version: 0,
-            trace_id,
-            span_id,
-            parent_span_id: None,
-            sampled: (flags & 0x01) != 0,
-        })
-    }
-
-    /// Create a child span preserving `trace_id` and recording `self.span_id` as `parent_span_id`.
-    #[must_use]
-    pub fn child_span(&self) -> Self {
-        let seq = TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut rng = SeededRng::new(seq ^ 0x9e37_79b9_7f4a_7c15);
-        let next_span = rng.next_u64().max(1);
-        Self {
-            version: self.version,
-            trace_id: self.trace_id.clone(),
-            span_id: format!("{next_span:016x}"),
-            parent_span_id: Some(self.span_id.clone()),
-            sampled: self.sampled,
-        }
-    }
-
-    /// Format as a W3C `traceparent` header string (`00-<trace_id>-<span_id>-01`).
-    #[must_use]
-    pub fn to_traceparent(&self) -> String {
-        let flags = if self.sampled { "01" } else { "00" };
-        format!(
-            "{:02x}-{}-{}-{}",
-            self.version, self.trace_id, self.span_id, flags
-        )
-    }
-}
-
-/// Parsed HTTP/1.1 response returned by `send_http_request`.
+/// Parsed HTTP/1.1 response returned by [`send_http_request`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status_code: u16,
@@ -265,16 +43,18 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// Zero-dependency HTTP/1.1 REST and Prometheus observability gateway backed by `ClusterClient`,
-/// with optional zero-trust `SecurityGate` enforcement (scoped API keys, RBAC, QPS quotas, and
-/// tamper-evident hash-chained audit logging).
+/// Zero-dependency HTTP/1.1 REST and Prometheus observability gateway backed by `ClusterClient`
+/// and `CollectionRegistry`, with optional zero-trust `SecurityGate` enforcement.
 #[derive(Clone)]
 pub struct HttpGatewayServer {
     client: ClusterClient,
     metrics: Arc<RwLock<PrometheusMetrics>>,
-    latency_samples_ms: Arc<RwLock<Vec<f64>>>,
+    latency_window: Arc<RwLock<BoundedLatencyWindow>>,
+    collections: Arc<CollectionRegistry>,
     security_gate: Option<Arc<Mutex<SecurityGate>>>,
     max_body_bytes: usize,
+    read_timeout: Duration,
+    max_connections: usize,
     draining: Arc<AtomicBool>,
 }
 
@@ -291,9 +71,12 @@ impl HttpGatewayServer {
         Self {
             client,
             metrics: Arc::new(RwLock::new(initial)),
-            latency_samples_ms: Arc::new(RwLock::new(Vec::new())),
+            latency_window: Arc::new(RwLock::new(BoundedLatencyWindow::default())),
+            collections: Arc::new(CollectionRegistry::new()),
             security_gate: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             draining: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -307,11 +90,43 @@ impl HttpGatewayServer {
     }
 
     /// Configure the maximum allowed HTTP request body size in bytes (default `16 MiB`).
-    /// Requests exceeding `max_bytes` are rejected with `413 Payload Too Large`.
     #[must_use]
     pub fn with_max_body_bytes(mut self, max_bytes: usize) -> Self {
         self.max_body_bytes = max_bytes;
         self
+    }
+
+    /// Configure the per-connection socket read timeout (default `5s`).
+    #[must_use]
+    pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
+        self
+    }
+
+    /// Configure the maximum concurrent TCP connections handled by `spawn_http_gateway` (default `512`).
+    #[must_use]
+    pub fn with_max_connections(mut self, max_conns: usize) -> Self {
+        self.max_connections = max_conns.max(1);
+        self
+    }
+
+    /// Share an explicit `CollectionRegistry` across gateway instances.
+    #[must_use]
+    pub fn with_collections(mut self, collections: Arc<CollectionRegistry>) -> Self {
+        self.collections = collections;
+        self
+    }
+
+    /// Borrow the multi-collection namespace registry hosted by this gateway.
+    #[must_use]
+    pub fn collections(&self) -> &Arc<CollectionRegistry> {
+        &self.collections
+    }
+
+    /// Current number of latency samples retained in the bounded sliding window.
+    #[must_use]
+    pub fn latency_sample_count(&self) -> usize {
+        self.latency_window.read().map_or(0, |w| w.len())
     }
 
     /// Toggle graceful Kubernetes drain state (`true` causes `GET /readyz` to return `503`).
@@ -369,14 +184,10 @@ impl HttpGatewayServer {
         let rf = u64::from(topo.replication_factor.max(1));
         let logical_vectors = total_replica_vectors / rf;
 
-        let (p50, p95, p99) = {
-            let guard = self.latency_samples_ms.read();
-            if let Ok(samples) = guard {
-                compute_percentiles(&samples)
-            } else {
-                (0.0, 0.0, 0.0)
-            }
-        };
+        let (p50, p95, p99) = self
+            .latency_window
+            .read()
+            .map_or((0.0, 0.0, 0.0), |win| win.percentiles());
 
         self.update_metrics(|m| {
             m.active_nodes = active_nodes;
@@ -400,7 +211,8 @@ impl HttpGatewayServer {
         let request_line = lines.next().unwrap_or_default().trim();
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("GET");
-        let path = parts.next().unwrap_or("/");
+        let raw_path = parts.next().unwrap_or("/");
+        let path = raw_path.split('?').next().unwrap_or(raw_path);
 
         let mut req_headers: BTreeMap<String, String> = BTreeMap::new();
         for line in lines {
@@ -441,8 +253,7 @@ impl HttpGatewayServer {
             ("GET", "/readyz") => self.handle_readyz(&span, start).await,
             ("GET", "/metrics") => {
                 self.refresh_cluster_telemetry().await;
-                let snap = self.metrics_snapshot();
-                let text = snap.render_prometheus_text();
+                let text = self.metrics_snapshot().render_prometheus_text();
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                 build_http_response(
                     200,
@@ -453,89 +264,209 @@ impl HttpGatewayServer {
                     &text,
                 )
             }
-            ("POST", "/v1/upsert") => {
-                if let Err(denied_resp) = self.authorize_http_route(
-                    &req_headers,
-                    TenantRole::Writer,
-                    "http.upsert",
-                    &span,
-                    start,
-                ) {
-                    return denied_resp;
+            ("GET", "/openapi.json") => build_http_response(
+                200,
+                "OK",
+                "application/json",
+                &span,
+                start.elapsed().as_secs_f64() * 1000.0,
+                openapi_spec_json(),
+            ),
+            ("POST", "/v1/upsert") => match self.authorize_http_route(
+                &req_headers,
+                TenantRole::Writer,
+                "http.upsert",
+                &span,
+                start,
+            ) {
+                Ok(_) => self.handle_upsert(body, &span, start).await,
+                Err(resp) => resp,
+            },
+            ("POST", "/v1/upsert_batch") => match self.authorize_http_route(
+                &req_headers,
+                TenantRole::Writer,
+                "http.upsert_batch",
+                &span,
+                start,
+            ) {
+                Ok(_) => self.handle_upsert_batch(body, &span, start).await,
+                Err(resp) => resp,
+            },
+            ("POST", "/v1/delete") => match self.authorize_http_route(
+                &req_headers,
+                TenantRole::Writer,
+                "http.delete",
+                &span,
+                start,
+            ) {
+                Ok(_) => self.handle_delete(body, &span, start).await,
+                Err(resp) => resp,
+            },
+            ("POST", "/v1/search") => match self.authorize_http_route(
+                &req_headers,
+                TenantRole::Reader,
+                "http.search",
+                &span,
+                start,
+            ) {
+                Ok(_) => self.handle_search(body, &span, start).await,
+                Err(resp) => resp,
+            },
+            ("GET", "/v1/topology") => match self.authorize_http_route(
+                &req_headers,
+                TenantRole::Reader,
+                "http.topology",
+                &span,
+                start,
+            ) {
+                Ok(_) => self.handle_topology(&span, start).await,
+                Err(resp) => resp,
+            },
+            ("GET", "/v1/audit") => match self.authorize_http_route(
+                &req_headers,
+                TenantRole::Admin,
+                "http.audit",
+                &span,
+                start,
+            ) {
+                Ok(_) => self.handle_audit(&span, start),
+                Err(resp) => resp,
+            },
+            ("POST", "/v1/collections") => match self.authorize_http_route(
+                &req_headers,
+                TenantRole::Admin,
+                "http.collections.create",
+                &span,
+                start,
+            ) {
+                Ok(_) => self.collections.handle_http_create(body, &span, start),
+                Err(resp) => resp,
+            },
+            ("GET", "/v1/collections") => match self.authorize_http_route(
+                &req_headers,
+                TenantRole::Reader,
+                "http.collections.list",
+                &span,
+                start,
+            ) {
+                Ok(_) => {
+                    let resp_json = self.collections.render_list_json(&span.trace_id);
+                    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    build_http_response(
+                        200,
+                        "OK",
+                        "application/json",
+                        &span,
+                        latency_ms,
+                        &resp_json,
+                    )
                 }
-                self.handle_upsert(body, &span, start).await
-            }
-            ("POST", "/v1/upsert_batch") => {
-                if let Err(denied_resp) = self.authorize_http_route(
-                    &req_headers,
-                    TenantRole::Writer,
-                    "http.upsert_batch",
-                    &span,
-                    start,
-                ) {
-                    return denied_resp;
-                }
-                self.handle_upsert_batch(body, &span, start).await
-            }
-            ("POST", "/v1/delete") => {
-                if let Err(denied_resp) = self.authorize_http_route(
-                    &req_headers,
-                    TenantRole::Writer,
-                    "http.delete",
-                    &span,
-                    start,
-                ) {
-                    return denied_resp;
-                }
-                self.handle_delete(body, &span, start).await
-            }
-            ("POST", "/v1/search") => {
-                if let Err(denied_resp) = self.authorize_http_route(
-                    &req_headers,
-                    TenantRole::Reader,
-                    "http.search",
-                    &span,
-                    start,
-                ) {
-                    return denied_resp;
-                }
-                self.handle_search(body, &span, start).await
-            }
-            ("GET", "/v1/topology") => {
-                if let Err(denied_resp) = self.authorize_http_route(
-                    &req_headers,
-                    TenantRole::Reader,
-                    "http.topology",
-                    &span,
-                    start,
-                ) {
-                    return denied_resp;
-                }
-                self.handle_topology(&span, start).await
-            }
-            ("GET", "/v1/audit") => {
-                if let Err(denied_resp) = self.authorize_http_route(
-                    &req_headers,
-                    TenantRole::Admin,
-                    "http.audit",
-                    &span,
-                    start,
-                ) {
-                    return denied_resp;
-                }
-                self.handle_audit(&span, start)
-            }
+                Err(resp) => resp,
+            },
             _ => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                build_http_response(
-                    404,
-                    "Not Found",
-                    "application/json",
-                    &span,
-                    latency_ms,
-                    "{\"status\":\"error\",\"error\":\"route not found\"}",
-                )
+                if let Some(subpath) = path.strip_prefix("/v1/collections/") {
+                    return self.route_collection_subpath(
+                        method,
+                        subpath,
+                        &req_headers,
+                        body,
+                        &span,
+                        start,
+                    );
+                }
+                not_found_response(&span, start)
             }
+        }
+    }
+
+    fn route_collection_subpath(
+        &self,
+        method: &str,
+        subpath: &str,
+        req_headers: &BTreeMap<String, String>,
+        body: &str,
+        span: &TraceSpan,
+        start: Instant,
+    ) -> String {
+        if subpath.is_empty() {
+            return not_found_response(span, start);
+        }
+        if method == "DELETE" && !subpath.contains('/') {
+            return match self.authorize_http_route(
+                req_headers,
+                TenantRole::Admin,
+                "http.collections.delete",
+                span,
+                start,
+            ) {
+                Ok(_) => self.collections.handle_http_drop(subpath, span, start),
+                Err(resp) => resp,
+            };
+        }
+        if method == "POST" {
+            if let Some((col_name, action)) = subpath.split_once('/') {
+                if col_name.is_empty() || action.contains('/') {
+                    return not_found_response(span, start);
+                }
+                return match action {
+                    "upsert" => match self.authorize_http_route(
+                        req_headers,
+                        TenantRole::Writer,
+                        "http.collections.upsert",
+                        span,
+                        start,
+                    ) {
+                        Ok(org) => self
+                            .collections
+                            .handle_http_upsert(col_name, &org, body, span, start),
+                        Err(resp) => resp,
+                    },
+                    "search" => match self.authorize_http_route(
+                        req_headers,
+                        TenantRole::Reader,
+                        "http.collections.search",
+                        span,
+                        start,
+                    ) {
+                        Ok(org) => {
+                            let (resp, lat_opt) = self
+                                .collections
+                                .handle_http_search(col_name, &org, body, span, start);
+                            if let Some(lat) = lat_opt {
+                                self.record_search_latency(lat);
+                            }
+                            resp
+                        }
+                        Err(resp) => resp,
+                    },
+                    "delete" => match self.authorize_http_route(
+                        req_headers,
+                        TenantRole::Writer,
+                        "http.collections.delete_vec",
+                        span,
+                        start,
+                    ) {
+                        Ok(org) => self
+                            .collections
+                            .handle_http_delete_vec(col_name, &org, body, span, start),
+                        Err(resp) => resp,
+                    },
+                    _ => not_found_response(span, start),
+                };
+            }
+        }
+        not_found_response(span, start)
+    }
+
+    fn record_search_latency(&self, latency_ms: f64) {
+        if let Ok(mut win) = self.latency_window.write() {
+            win.record(latency_ms);
+            let (p50, p95, p99) = win.percentiles();
+            self.update_metrics(|m| {
+                m.search_latency_p50_ms = p50;
+                m.search_latency_p95_ms = p95;
+                m.search_latency_p99_ms = p99;
+            });
         }
     }
 
@@ -546,34 +477,25 @@ impl HttpGatewayServer {
         action_label: &str,
         span: &TraceSpan,
         start: Instant,
-    ) -> Result<(), String> {
-        let Some(gate_arc) = &self.security_gate else {
-            return Ok(());
-        };
-
+    ) -> Result<OrgId, String> {
         let org_id = match req_headers.get("x-org-id") {
             Some(raw_org) => match OrgId::new(raw_org.as_str()) {
                 Ok(org) => org,
                 Err(_) => {
-                    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let json = format!(
-                        "{{\"status\":\"error\",\"error\":\"invalid 'x-org-id' header\",\"trace_id\":\"{}\"}}",
-                        span.trace_id
-                    );
-                    return Err(build_http_response(
+                    return Err(json_error_response(
                         400,
                         "Bad Request",
-                        "application/json",
+                        "invalid 'x-org-id' header",
                         span,
-                        latency_ms,
-                        &json,
+                        start,
                     ));
                 }
             },
-            None => OrgId::new("default").unwrap_or_else(|_| {
-                // Infallible for non-empty literal "default", kept panic-free.
-                unreachable!()
-            }),
+            None => OrgId::new("default").unwrap_or_else(|_| unreachable!()),
+        };
+
+        let Some(gate_arc) = &self.security_gate else {
+            return Ok(org_id);
         };
 
         let token = extract_bearer_token(req_headers);
@@ -585,7 +507,7 @@ impl HttpGatewayServer {
         };
 
         match auth_result {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(org_id),
             Err(err) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                 Err(map_security_error_response(&err, span, latency_ms))
@@ -657,62 +579,32 @@ impl HttpGatewayServer {
                 err @ (VektorError::DimensionMismatch { .. }
                 | VektorError::InvalidVector(_)
                 | VektorError::InvalidConfig(_)),
-            ) => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let resp_json = format!(
-                    "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
-                    escape_json_str(&err.to_string()),
-                    span.trace_id
-                );
-                build_http_response(
-                    400,
-                    "Bad Request",
-                    "application/json",
-                    span,
-                    latency_ms,
-                    &resp_json,
-                )
-            }
+            ) => json_error_response(400, "Bad Request", &err.to_string(), span, start),
             Err(err) => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let resp_json = format!(
-                    "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
-                    escape_json_str(&err.to_string()),
-                    span.trace_id
-                );
-                build_http_response(
-                    503,
-                    "Service Unavailable",
-                    "application/json",
-                    span,
-                    latency_ms,
-                    &resp_json,
-                )
+                json_error_response(503, "Service Unavailable", &err.to_string(), span, start)
             }
         }
     }
 
     async fn handle_upsert(&self, body: &str, span: &TraceSpan, start: Instant) -> String {
         let Some(id) = extract_json_u64(body, "id") else {
-            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             return build_http_response(
                 400,
                 "Bad Request",
                 "application/json",
                 span,
-                latency_ms,
+                start.elapsed().as_secs_f64() * 1000.0,
                 "{\"status\":\"error\",\"error\":\"missing or invalid 'id'\"}",
             );
         };
-        let write_id = extract_json_u64(body, "write_id").unwrap_or(id);
+        let write_id = extract_json_u64(body, "write_id").unwrap_or(0);
         let Some(vector) = extract_json_f32_array(body, "vector") else {
-            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             return build_http_response(
                 400,
                 "Bad Request",
                 "application/json",
                 span,
-                latency_ms,
+                start.elapsed().as_secs_f64() * 1000.0,
                 "{\"status\":\"error\",\"error\":\"missing or invalid 'vector'\"}",
             );
         };
@@ -731,33 +623,19 @@ impl HttpGatewayServer {
                 build_http_response(200, "OK", "application/json", span, latency_ms, &resp_json)
             }
             Err(err) => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let resp_json = format!(
-                    "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
-                    escape_json_str(&err.to_string()),
-                    span.trace_id
-                );
-                build_http_response(
-                    503,
-                    "Service Unavailable",
-                    "application/json",
-                    span,
-                    latency_ms,
-                    &resp_json,
-                )
+                json_error_response(503, "Service Unavailable", &err.to_string(), span, start)
             }
         }
     }
 
     async fn handle_search(&self, body: &str, span: &TraceSpan, start: Instant) -> String {
         let Some(query) = extract_json_f32_array(body, "query") else {
-            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             return build_http_response(
                 400,
                 "Bad Request",
                 "application/json",
                 span,
-                latency_ms,
+                start.elapsed().as_secs_f64() * 1000.0,
                 "{\"status\":\"error\",\"error\":\"missing or invalid 'query'\"}",
             );
         };
@@ -767,23 +645,8 @@ impl HttpGatewayServer {
         match self.client.search(&query, top_k, ef_search).await {
             Ok(hits) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                if let Ok(mut samples) = self.latency_samples_ms.write() {
-                    samples.push(latency_ms);
-                    let (p50, p95, p99) = compute_percentiles(&samples);
-                    self.update_metrics(|m| {
-                        m.search_latency_p50_ms = p50;
-                        m.search_latency_p95_ms = p95;
-                        m.search_latency_p99_ms = p99;
-                    });
-                }
-                let mut hits_json = String::from("[");
-                for (idx, h) in hits.iter().enumerate() {
-                    if idx > 0 {
-                        hits_json.push(',');
-                    }
-                    let _ = write!(hits_json, "{{\"id\":{},\"score\":{:.6}}}", h.id, h.score);
-                }
-                hits_json.push(']');
+                self.record_search_latency(latency_ms);
+                let hits_json = format_hits_json(&hits);
                 let resp_json = format!(
                     "{{\"status\":\"ok\",\"hits\":{hits_json},\"trace_id\":\"{}\"}}",
                     span.trace_id
@@ -791,37 +654,23 @@ impl HttpGatewayServer {
                 build_http_response(200, "OK", "application/json", span, latency_ms, &resp_json)
             }
             Err(err) => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let resp_json = format!(
-                    "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
-                    escape_json_str(&err.to_string()),
-                    span.trace_id
-                );
-                build_http_response(
-                    503,
-                    "Service Unavailable",
-                    "application/json",
-                    span,
-                    latency_ms,
-                    &resp_json,
-                )
+                json_error_response(503, "Service Unavailable", &err.to_string(), span, start)
             }
         }
     }
 
     async fn handle_delete(&self, body: &str, span: &TraceSpan, start: Instant) -> String {
         let Some(id) = extract_json_u64(body, "id") else {
-            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             return build_http_response(
                 400,
                 "Bad Request",
                 "application/json",
                 span,
-                latency_ms,
+                start.elapsed().as_secs_f64() * 1000.0,
                 "{\"status\":\"error\",\"error\":\"missing or invalid 'id'\"}",
             );
         };
-        let write_id = extract_json_u64(body, "write_id").unwrap_or(id);
+        let write_id = extract_json_u64(body, "write_id").unwrap_or(0);
 
         match self.client.delete(id, write_id).await {
             Ok((shard_id, seq_no)) => {
@@ -837,20 +686,7 @@ impl HttpGatewayServer {
                 build_http_response(200, "OK", "application/json", span, latency_ms, &resp_json)
             }
             Err(err) => {
-                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let resp_json = format!(
-                    "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
-                    escape_json_str(&err.to_string()),
-                    span.trace_id
-                );
-                build_http_response(
-                    503,
-                    "Service Unavailable",
-                    "application/json",
-                    span,
-                    latency_ms,
-                    &resp_json,
-                )
+                json_error_response(503, "Service Unavailable", &err.to_string(), span, start)
             }
         }
     }
@@ -873,13 +709,12 @@ impl HttpGatewayServer {
 
     fn handle_audit(&self, span: &TraceSpan, start: Instant) -> String {
         let Some(gate_arc) = &self.security_gate else {
-            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
             return build_http_response(
                 200,
                 "OK",
                 "application/json",
                 span,
-                latency_ms,
+                start.elapsed().as_secs_f64() * 1000.0,
                 "{\"status\":\"ok\",\"security_enabled\":false,\"entries_count\":0,\"head_hash\":0,\"chain_valid\":true}",
             );
         };
@@ -911,8 +746,8 @@ impl HttpGatewayServer {
     }
 }
 
-/// Bind a `tokio::net::TcpListener` on `bind_addr` and spawn the HTTP/1.1 gateway server task.
-/// Returns `(bound_socket_addr, join_handle)`.
+/// Bind a `tokio::net::TcpListener` on `bind_addr` and spawn the hardened HTTP/1.1 gateway loop
+/// enforcing `gateway.max_connections` via `Semaphore` and `gateway.read_timeout` via `tokio::time::timeout`.
 pub async fn spawn_http_gateway(
     bind_addr: &str,
     gateway: HttpGatewayServer,
@@ -925,17 +760,23 @@ pub async fn spawn_http_gateway(
         .map_err(|e| VektorError::WalIo(format!("failed to read local_addr: {e}")))?
         .to_string();
 
+    let conn_semaphore = Arc::new(Semaphore::new(gateway.max_connections.max(1)));
     let handle = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
+            let Ok(permit) = Arc::clone(&conn_semaphore).acquire_owned().await else {
+                break;
+            };
             let gw = gateway.clone();
             tokio::spawn(async move {
-                match read_full_http_request(&mut stream, gw.max_body_bytes).await {
-                    Ok(HttpReadOutcome::Complete(req_str)) => {
+                let _permit = permit;
+                let read_fut = read_full_http_request(&mut stream, gw.max_body_bytes);
+                match tokio::time::timeout(gw.read_timeout, read_fut).await {
+                    Ok(Ok(HttpReadOutcome::Complete(req_str))) => {
                         let resp_str = gw.handle_http_request(&req_str).await;
                         let _ = stream.write_all(resp_str.as_bytes()).await;
                         let _ = stream.shutdown().await;
                     }
-                    Ok(HttpReadOutcome::PayloadTooLarge { traceparent }) => {
+                    Ok(Ok(HttpReadOutcome::PayloadTooLarge { traceparent })) => {
                         let span = traceparent
                             .as_deref()
                             .and_then(|tp| TraceSpan::parse_traceparent(tp).ok())
@@ -951,7 +792,20 @@ pub async fn spawn_http_gateway(
                         let _ = stream.write_all(resp_str.as_bytes()).await;
                         let _ = stream.shutdown().await;
                     }
-                    Err(_) => {}
+                    Ok(Err(_)) => {}
+                    Err(_elapsed) => {
+                        let span = TraceSpan::generate();
+                        let resp_str = build_http_response(
+                            408,
+                            "Request Timeout",
+                            "application/json",
+                            &span,
+                            gw.read_timeout.as_secs_f64() * 1000.0,
+                            "{\"status\":\"error\",\"error\":\"request read timeout\"}",
+                        );
+                        let _ = stream.write_all(resp_str.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
                 }
             });
         }
@@ -983,7 +837,6 @@ pub async fn send_http_request(
     raw_req.push_str(body);
 
     let write_res = stream.write_all(raw_req.as_bytes()).await;
-
     let mut resp_bytes = Vec::new();
     let read_res = stream.read_to_end(&mut resp_bytes).await;
     if !resp_bytes.is_empty() {
@@ -995,9 +848,7 @@ pub async fn send_http_request(
 
     write_res.map_err(|e| VektorError::WalIo(format!("http write error: {e}")))?;
     read_res.map_err(|e| VektorError::WalIo(format!("http read error: {e}")))?;
-
-    let raw_resp = String::from_utf8_lossy(&resp_bytes);
-    parse_http_response(&raw_resp)
+    parse_http_response(&String::from_utf8_lossy(&resp_bytes))
 }
 
 enum HttpReadOutcome {
@@ -1070,6 +921,40 @@ async fn drain_bounded_bytes(stream: &mut TcpStream, mut remaining: usize) {
     }
 }
 
+fn not_found_response(span: &TraceSpan, start: Instant) -> String {
+    build_http_response(
+        404,
+        "Not Found",
+        "application/json",
+        span,
+        start.elapsed().as_secs_f64() * 1000.0,
+        "{\"status\":\"error\",\"error\":\"route not found\"}",
+    )
+}
+
+fn json_error_response(
+    status_code: u16,
+    reason: &str,
+    msg: &str,
+    span: &TraceSpan,
+    start: Instant,
+) -> String {
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let body = format!(
+        "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
+        escape_json_str(msg),
+        span.trace_id
+    );
+    build_http_response(
+        status_code,
+        reason,
+        "application/json",
+        span,
+        latency_ms,
+        &body,
+    )
+}
+
 fn extract_header_value(header_str: &str, name: &str) -> Option<String> {
     for line in header_str.lines() {
         if let Some((k, v)) = line.split_once(':') {
@@ -1099,16 +984,6 @@ fn parse_content_length(header_str: &str) -> usize {
         }
     }
     0
-}
-
-fn split_http_head_and_body(raw: &str) -> (&str, &str) {
-    if let Some((head, body)) = raw.split_once("\r\n\r\n") {
-        (head, body)
-    } else if let Some((head, body)) = raw.split_once("\n\n") {
-        (head, body)
-    } else {
-        (raw, "")
-    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -1164,8 +1039,7 @@ fn map_security_error_response(err: &SecurityError, span: &TraceSpan, latency_ms
             )
         }
         SecurityError::RateLimited { retry_after_ms, .. } => {
-            let retry_secs = retry_after_ms.div_ceil(1000).max(1);
-            let retry_secs_str = retry_secs.to_string();
+            let retry_secs = retry_after_ms.div_ceil(1000).max(1).to_string();
             let body = format!(
                 "{{\"status\":\"error\",\"error\":\"{escaped}\",\"retry_after_ms\":{retry_after_ms},\"trace_id\":\"{}\"}}",
                 span.trace_id
@@ -1176,7 +1050,7 @@ fn map_security_error_response(err: &SecurityError, span: &TraceSpan, latency_ms
                 "application/json",
                 span,
                 latency_ms,
-                &[("Retry-After", &retry_secs_str)],
+                &[("Retry-After", &retry_secs)],
                 &body,
             )
         }
@@ -1211,649 +1085,9 @@ fn map_security_error_response(err: &SecurityError, span: &TraceSpan, latency_ms
     }
 }
 
-fn build_http_response(
-    status_code: u16,
-    reason: &str,
-    content_type: &str,
-    span: &TraceSpan,
-    latency_ms: f64,
-    body: &str,
-) -> String {
-    build_http_response_with_headers(
-        status_code,
-        reason,
-        content_type,
-        span,
-        latency_ms,
-        &[],
-        body,
-    )
-}
-
-fn build_http_response_with_headers(
-    status_code: u16,
-    reason: &str,
-    content_type: &str,
-    span: &TraceSpan,
-    latency_ms: f64,
-    extra_headers: &[(&str, &str)],
-    body: &str,
-) -> String {
-    let mut out = format!(
-        "HTTP/1.1 {status_code} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nx-trace-id: {}\r\ntraceparent: {}\r\nx-latency-ms: {latency_ms:.3}\r\n",
-        body.len(),
-        span.trace_id,
-        span.to_traceparent(),
-    );
-    for &(k, v) in extra_headers {
-        let _ = write!(out, "{k}: {v}\r\n");
-    }
-    out.push_str("connection: close\r\n\r\n");
-    out.push_str(body);
-    out
-}
-
-fn parse_http_response(raw: &str) -> Result<HttpResponse, VektorError> {
-    let (head, body) = split_http_head_and_body(raw);
-    let mut lines = head.lines();
-    let status_line = lines
-        .next()
-        .ok_or(VektorError::InvalidConfig("empty HTTP response"))?;
-    let mut parts = status_line.split_whitespace();
-    let _http_ver = parts.next();
-    let status_code = parts
-        .next()
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or(VektorError::InvalidConfig("invalid HTTP status code"))?;
-
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-
-    Ok(HttpResponse {
-        status_code,
-        headers,
-        body: body.to_string(),
-    })
-}
-
-fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
-    let pattern = format!("\"{key}\"");
-    let start_idx = json.find(&pattern)? + pattern.len();
-    let rest = json.get(start_idx..)?.trim_start();
-    let after_colon = rest.strip_prefix(':')?.trim_start();
-    let num_end = after_colon
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(after_colon.len());
-    after_colon.get(..num_end)?.parse::<u64>().ok()
-}
-
-fn extract_json_f32_array(json: &str, key: &str) -> Option<Vec<f32>> {
-    let pattern = format!("\"{key}\"");
-    let start_idx = json.find(&pattern)? + pattern.len();
-    let rest = json.get(start_idx..)?.trim_start();
-    let after_colon = rest.strip_prefix(':')?.trim_start();
-    let after_open = after_colon.strip_prefix('[')?;
-    let close_idx = after_open.find(']')?;
-    let inner = after_open.get(..close_idx)?.trim();
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut out = Vec::new();
-    for item in inner.split(',') {
-        let val = item.trim().parse::<f32>().ok()?;
-        out.push(val);
-    }
-    Some(out)
-}
-
-fn extract_json_upsert_batch(json: &str) -> Option<Vec<(VectorId, WriteId, Vec<f32>)>> {
-    let pattern = "\"records\"";
-    let start_idx = json.find(pattern)? + pattern.len();
-    let rest = json.get(start_idx..)?.trim_start();
-    let after_colon = rest.strip_prefix(':')?.trim_start();
-    let after_open = after_colon.strip_prefix('[')?;
-
-    let array_end = find_matching_delimiter(after_open, b'[', b']')?;
-    let inner = after_open.get(..array_end)?.trim();
-    if inner.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut records = Vec::new();
-    let mut cursor = inner;
-    while !cursor.is_empty() {
-        cursor = cursor.trim_start();
-        if let Some(stripped) = cursor.strip_prefix(',') {
-            cursor = stripped.trim_start();
-        }
-        if cursor.is_empty() {
-            break;
-        }
-        let after_brace = cursor.strip_prefix('{')?;
-        let obj_end = find_matching_delimiter(after_brace, b'{', b'}')?;
-        let obj_body = after_brace.get(..obj_end)?;
-
-        let id = extract_json_u64(obj_body, "id")?;
-        let write_id = extract_json_u64(obj_body, "write_id").unwrap_or(id);
-        let vector = extract_json_f32_array(obj_body, "vector")?;
-        records.push((id, write_id, vector));
-
-        cursor = after_brace.get(obj_end + 1..)?.trim_start();
-    }
-
-    Some(records)
-}
-
-fn find_matching_delimiter(input: &str, open: u8, close: u8) -> Option<usize> {
-    let bytes = input.as_bytes();
-    let mut depth = 1_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (idx, &b) in bytes.iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if b == b'"' {
-            in_string = true;
-        } else if b == open {
-            depth = depth.saturating_add(1);
-        } else if b == close {
-            depth -= 1;
-            if depth == 0 {
-                return Some(idx);
-            }
-        }
-    }
-    None
-}
-
-fn escape_json_str(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn compute_percentiles(samples: &[f64]) -> (f64, f64, f64) {
-    if samples.is_empty() {
-        return (0.0, 0.0, 0.0);
-    }
-    let mut sorted = samples.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let p50 = percentile_sorted(&sorted, 0.50);
-    let p95 = percentile_sorted(&sorted, 0.95);
-    let p99 = percentile_sorted(&sorted, 0.99);
-    (p50, p95, p99)
-}
-
-fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let idx = ((sorted.len().saturating_sub(1) as f64) * q.clamp(0.0, 1.0)).round() as usize;
-    sorted.get(idx).copied().unwrap_or(0.0)
-}
-
-/// A single programmable step in an automated chaos campaign.
-#[derive(Debug, Clone)]
-pub enum ChaosStep {
-    /// Seed `count` deterministic unit vectors across all shards using batched WAL fsync.
-    SeedVectors {
-        count: usize,
-        batch_size: usize,
-        seed: u64,
-    },
-    /// Execute concurrent `W=2` quorum writes and scatter-gather reads.
-    ConcurrentWorkload {
-        writes: usize,
-        reads: usize,
-        top_k: usize,
-        ef_search: usize,
-        seed: u64,
-    },
-    /// Abruptly terminate `node_id` (simulating `SIGKILL`) and trigger coordinator failover + union WAL reconciliation.
-    KillNode { node_id: NodeId },
-    /// Audit all surviving shard WALs against the external acknowledged-write ledger (`acked_writes_lost == 0`).
-    VerifyZeroWriteLoss,
-    /// Spawn a replacement node `node_id`, stream historical + live WAL catch-up (`RECOVERING` -> `HEALTHY`).
-    AddReplacementNode { node_id: NodeId },
-    /// Measure distributed `recall@10` against an exact brute-force oracle and verify `p95` latency SLA.
-    AssertRecallAndLatencySla {
-        queries: usize,
-        top_k: usize,
-        ef_search: usize,
-        min_recall_at_10: f64,
-        max_p95_ms: f64,
-        seed: u64,
-    },
-}
-
-/// Falsifiable report produced by `ChaosCampaign::run`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChaosCampaignReport {
-    pub steps_executed: usize,
-    pub acked_writes_verified: usize,
-    pub acked_writes_lost: usize,
-    pub measured_recall_at_10: f64,
-    pub measured_p95_ms: f64,
-    pub sla_passed: bool,
-    pub step_logs: Vec<String>,
-}
-
-/// Automated multi-step fault-injection and SLA verification runner against a live `CoordinatorService` + `NodeService` cluster.
-#[derive(Debug, Clone)]
-pub struct ChaosCampaign {
-    pub config: ClusterConfig,
-    pub hnsw_params: HnswParams,
-    pub initial_nodes: Vec<NodeId>,
-    pub steps: Vec<ChaosStep>,
-}
-
-impl ChaosCampaign {
-    /// Construct a new `ChaosCampaign` with default `HnswParams`.
-    #[must_use]
-    pub fn new(config: ClusterConfig, initial_nodes: Vec<NodeId>, steps: Vec<ChaosStep>) -> Self {
-        Self {
-            config,
-            hnsw_params: HnswParams::default(),
-            initial_nodes,
-            steps,
-        }
-    }
-
-    /// Override `HnswParams` used by cluster nodes during the chaos campaign.
-    #[must_use]
-    pub fn with_hnsw_params(mut self, params: HnswParams) -> Self {
-        self.hnsw_params = params;
-        self
-    }
-
-    /// Execute the entire chaos schedule against real localhost gRPC node & coordinator servers.
-    pub async fn run(&self) -> Result<ChaosCampaignReport, VektorError> {
-        self.config.validate()?;
-        if self.initial_nodes.is_empty() {
-            return Err(VektorError::InvalidConfig(
-                "chaos campaign requires at least 1 initial node",
-            ));
-        }
-
-        let mut node_handles: BTreeMap<NodeId, (String, PathBuf, JoinHandle<()>)> = BTreeMap::new();
-        let mut initial_descriptors = Vec::with_capacity(self.initial_nodes.len());
-
-        for &node_id in &self.initial_nodes {
-            let (addr, dir, handle) =
-                spawn_chaos_node(node_id, self.config.clone(), self.hnsw_params).await?;
-            initial_descriptors.push((node_id, addr.clone()));
-            node_handles.insert(node_id, (addr, dir, handle));
-        }
-
-        let coord = CoordinatorService::new(self.config.clone(), initial_descriptors)?;
-        coord.push_all_shard_configs().await?;
-        let (coord_addr, coord_handle) = spawn_chaos_coord(coord.clone()).await?;
-        let client = ClusterClient::connect(&coord_addr).await?;
-
-        let mut exact_oracle = ExactIndex::new(self.config.dimensions, self.config.metric)?;
-        let mut acked_ledger: Vec<(WriteId, VectorId, ShardId)> = Vec::new();
-        let mut next_vec_id: VectorId = 1;
-        let mut next_write_id: WriteId = 10_000;
-
-        let mut steps_executed = 0_usize;
-        let mut acked_writes_verified = 0_usize;
-        let mut acked_writes_lost = 0_usize;
-        let mut measured_recall_at_10 = 1.0_f64;
-        let mut measured_p95_ms = 0.0_f64;
-        let mut sla_passed = true;
-        let mut step_logs = Vec::with_capacity(self.steps.len());
-
-        for step in &self.steps {
-            match step {
-                ChaosStep::SeedVectors {
-                    count,
-                    batch_size,
-                    seed,
-                } => {
-                    let mut rng = SeededRng::new(*seed);
-                    let effective_batch = (*batch_size).max(1);
-                    let mut by_shard: BTreeMap<ShardId, Vec<(VectorId, WriteId, Vec<f32>)>> =
-                        BTreeMap::new();
-
-                    for _ in 0..*count {
-                        let mut vec_buf = vec![0.0_f32; self.config.dimensions];
-                        rng.fill_unit_vector(&mut vec_buf);
-                        let id = next_vec_id;
-                        let write_id = next_write_id;
-                        next_vec_id += 1;
-                        next_write_id += 1;
-                        let shard_id = self.config.shard_for(id);
-                        by_shard
-                            .entry(shard_id)
-                            .or_default()
-                            .push((id, write_id, vec_buf));
-                    }
-
-                    for (shard_id, records) in by_shard {
-                        for chunk in records.chunks(effective_batch) {
-                            let assigned = client.seed_shard_batch(shard_id, chunk).await?;
-                            if assigned.len() == chunk.len() {
-                                for (id, write_id, vec_buf) in chunk {
-                                    exact_oracle.upsert(*id, vec_buf)?;
-                                    acked_ledger.push((*write_id, *id, shard_id));
-                                }
-                            }
-                        }
-                    }
-                    steps_executed += 1;
-                    step_logs.push(format!("SeedVectors(count={count})"));
-                }
-                ChaosStep::ConcurrentWorkload {
-                    writes,
-                    reads,
-                    top_k,
-                    ef_search,
-                    seed,
-                } => {
-                    let base_id = next_vec_id;
-                    let base_write_id = next_write_id;
-                    next_vec_id += *writes as u64;
-                    next_write_id += *writes as u64;
-
-                    let dims = self.config.dimensions;
-                    let write_client = client.clone();
-                    let write_count = *writes;
-                    let write_seed = *seed;
-
-                    let writer_task = tokio::spawn(async move {
-                        let mut rng = SeededRng::new(write_seed);
-                        let mut acked = Vec::with_capacity(write_count);
-                        for offset in 0..write_count {
-                            let mut v = vec![0.0_f32; dims];
-                            rng.fill_unit_vector(&mut v);
-                            let id = base_id + offset as u64;
-                            let wid = base_write_id + offset as u64;
-                            if let Ok((shard_id, _seq)) = write_client.upsert(id, wid, &v).await {
-                                acked.push((wid, id, shard_id, v));
-                            }
-                        }
-                        acked
-                    });
-
-                    let read_client = client.clone();
-                    let read_count = *reads;
-                    let k = (*top_k).max(1);
-                    let ef = (*ef_search).max(k);
-                    let read_seed = seed.wrapping_add(7919);
-
-                    let reader_task = tokio::spawn(async move {
-                        let mut rng = SeededRng::new(read_seed);
-                        let mut completed_reads = 0_usize;
-                        for _ in 0..read_count {
-                            let mut q = vec![0.0_f32; dims];
-                            rng.fill_unit_vector(&mut q);
-                            if let Ok(hits) = read_client.search(&q, k, ef).await {
-                                if !hits.is_empty() {
-                                    completed_reads += 1;
-                                }
-                            }
-                        }
-                        completed_reads
-                    });
-
-                    let acked_batch = writer_task
-                        .await
-                        .map_err(|e| VektorError::WalIo(format!("writer task join error: {e}")))?;
-                    let completed_reads = reader_task
-                        .await
-                        .map_err(|e| VektorError::WalIo(format!("reader task join error: {e}")))?;
-
-                    for (wid, id, shard_id, v) in acked_batch {
-                        exact_oracle.upsert(id, &v)?;
-                        acked_ledger.push((wid, id, shard_id));
-                    }
-
-                    steps_executed += 1;
-                    step_logs.push(format!(
-                        "ConcurrentWorkload(writes={writes}, reads_ok={completed_reads}/{reads})"
-                    ));
-                }
-                ChaosStep::KillNode { node_id } => {
-                    if let Some((_addr, _dir, handle)) = node_handles.get(node_id) {
-                        handle.abort();
-                    }
-                    coord.handle_node_failure(*node_id).await?;
-                    let _ = client.refresh_topology().await?;
-                    steps_executed += 1;
-                    step_logs.push(format!("KillNode(node_id={node_id})"));
-                }
-                ChaosStep::VerifyZeroWriteLoss => {
-                    let mut durable_write_ids: HashSet<WriteId> =
-                        HashSet::with_capacity(acked_ledger.len());
-                    for shard_id in 0..self.config.num_shards {
-                        let recs = client.verify_shard_wal_write_ids(shard_id).await?;
-                        for rec in recs {
-                            durable_write_ids.insert(rec.write_id);
-                        }
-                    }
-
-                    let mut verified = 0_usize;
-                    let mut lost = 0_usize;
-                    for &(wid, _vec_id, _shard_id) in &acked_ledger {
-                        if durable_write_ids.contains(&wid) {
-                            verified += 1;
-                        } else {
-                            lost += 1;
-                        }
-                    }
-                    acked_writes_verified = verified;
-                    acked_writes_lost += lost;
-                    if lost > 0 {
-                        sla_passed = false;
-                    }
-                    steps_executed += 1;
-                    step_logs.push(format!(
-                        "VerifyZeroWriteLoss(verified={verified}, lost={lost})"
-                    ));
-                }
-                ChaosStep::AddReplacementNode { node_id } => {
-                    let (addr, dir, handle) =
-                        spawn_chaos_node(*node_id, self.config.clone(), self.hnsw_params).await?;
-                    node_handles.insert(*node_id, (addr.clone(), dir, handle));
-                    let recovered_shards = coord.add_replacement_node(*node_id, addr).await?;
-                    let _ = client.refresh_topology().await?;
-                    steps_executed += 1;
-                    step_logs.push(format!(
-                        "AddReplacementNode(node_id={node_id}, recovered_shards={})",
-                        recovered_shards.len()
-                    ));
-                }
-                ChaosStep::AssertRecallAndLatencySla {
-                    queries,
-                    top_k,
-                    ef_search,
-                    min_recall_at_10,
-                    max_p95_ms,
-                    seed,
-                } => {
-                    let k = (*top_k).max(1);
-                    let ef = (*ef_search).max(k);
-                    let q_count = (*queries).max(1);
-                    let mut rng = SeededRng::new(*seed);
-                    let mut latencies_ms = Vec::with_capacity(q_count);
-                    let mut recall_sum = 0.0_f64;
-
-                    for _ in 0..q_count {
-                        let mut q = vec![0.0_f32; self.config.dimensions];
-                        rng.fill_unit_vector(&mut q);
-                        let exact_hits = exact_oracle.search(&q, k)?;
-                        let expected_ids: HashSet<VectorId> =
-                            exact_hits.iter().map(|h| h.id).collect();
-
-                        let t0 = Instant::now();
-                        let approx_hits = client.search(&q, k, ef).await?;
-                        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                        latencies_ms.push(elapsed_ms);
-
-                        if expected_ids.is_empty() {
-                            recall_sum += 1.0;
-                        } else {
-                            let matched = approx_hits
-                                .iter()
-                                .filter(|h| expected_ids.contains(&h.id))
-                                .count();
-                            recall_sum += (matched as f64) / (expected_ids.len() as f64);
-                        }
-                    }
-
-                    measured_recall_at_10 = recall_sum / (q_count as f64);
-                    let (_p50, p95, _p99) = compute_percentiles(&latencies_ms);
-                    measured_p95_ms = p95;
-
-                    let step_ok = acked_writes_lost == 0
-                        && measured_recall_at_10 >= *min_recall_at_10
-                        && measured_p95_ms <= *max_p95_ms;
-                    if !step_ok {
-                        sla_passed = false;
-                    }
-                    steps_executed += 1;
-                    step_logs.push(format!(
-                        "AssertRecallAndLatencySla(recall={measured_recall_at_10:.4}, p95_ms={measured_p95_ms:.3}, passed={step_ok})"
-                    ));
-                }
-            }
-        }
-
-        coord_handle.abort();
-        for (_id, (_addr, dir, handle)) in node_handles {
-            handle.abort();
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        Ok(ChaosCampaignReport {
-            steps_executed,
-            acked_writes_verified,
-            acked_writes_lost,
-            measured_recall_at_10,
-            measured_p95_ms,
-            sla_passed,
-            step_logs,
-        })
-    }
-}
-
-async fn spawn_chaos_node(
-    node_id: NodeId,
-    config: ClusterConfig,
-    params: HnswParams,
-) -> Result<(String, PathBuf, JoinHandle<()>), VektorError> {
-    let seq = CHAOS_DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("vektordist-m10-chaos-{pid}-{seq}-n{node_id}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    let svc = NodeService::open(node_id, &dir, config, params)?;
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| VektorError::WalIo(e.to_string()))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| VektorError::WalIo(e.to_string()))?
-        .to_string();
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let handle = tokio::spawn(async move {
-        let _ = Server::builder()
-            .add_service(ShardReplicaRpcServer::new(svc))
-            .serve_with_incoming(incoming)
-            .await;
-    });
-
-    Ok((addr, dir, handle))
-}
-
-async fn spawn_chaos_coord(
-    coord: CoordinatorService,
-) -> Result<(String, JoinHandle<()>), VektorError> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| VektorError::WalIo(e.to_string()))?;
-    let addr = listener
-        .local_addr()
-        .map_err(|e| VektorError::WalIo(e.to_string()))?
-        .to_string();
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-
-    let handle = tokio::spawn(async move {
-        let _ = Server::builder()
-            .add_service(TopologyRpcServer::new(coord))
-            .serve_with_incoming(incoming)
-            .await;
-    });
-
-    Ok((addr, handle))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn traceparent_roundtrip_and_child_span_propagation() {
-        let header = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let span = TraceSpan::parse_traceparent(header).unwrap();
-        assert_eq!(span.version, 0);
-        assert_eq!(span.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
-        assert_eq!(span.span_id, "00f067aa0ba902b7");
-        assert!(span.sampled);
-        assert_eq!(span.to_traceparent(), header);
-
-        let child = span.child_span();
-        assert_eq!(child.trace_id, span.trace_id);
-        assert_ne!(child.span_id, span.span_id);
-        assert_eq!(child.parent_span_id.as_deref(), Some("00f067aa0ba902b7"));
-    }
-
-    #[test]
-    fn invalid_traceparent_headers_are_rejected() {
-        assert!(TraceSpan::parse_traceparent("invalid").is_err());
-        assert!(TraceSpan::parse_traceparent(
-            "00-00000000000000000000000000000000-00f067aa0ba902b7-01"
-        )
-        .is_err());
-        assert!(TraceSpan::parse_traceparent(
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn prometheus_exposition_renders_all_required_metrics() {
-        let m = PrometheusMetrics {
-            active_nodes: 3,
-            configured_nodes: 3,
-            indexed_vectors: 1200,
-            search_latency_p50_ms: 1.25,
-            search_latency_p95_ms: 3.75,
-            search_latency_p99_ms: 5.50,
-            recall_at_10: 0.985,
-            acked_writes_total: 1200,
-            acked_writes_lost_total: 0,
-        };
-        let text = m.render_prometheus_text();
-        assert!(text.contains("# TYPE vektordist_active_nodes gauge"));
-        assert!(text.contains("vektordist_active_nodes 3"));
-        assert!(text.contains("vektordist_indexed_vectors 1200"));
-        assert!(text.contains("vektordist_recall_at_10 0.9850"));
-        assert!(text.contains("# TYPE vektordist_acked_writes_lost_total counter"));
-        assert!(text.contains("vektordist_acked_writes_lost_total 0"));
-    }
 
     #[test]
     fn bearer_extraction_and_security_error_http_mappings_cover_all_variants() {

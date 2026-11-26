@@ -27,3 +27,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-audit
       - run: cargo audit --deny warnings
+
+  python-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mypy ruff
+      - run: ruff check clients/python
+      - run: mypy --strict clients/python
+      - run: python3 -m unittest discover -s clients/python -p "test_*.py" -v

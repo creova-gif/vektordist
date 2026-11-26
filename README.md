@@ -227,6 +227,13 @@ Every HTTP response includes `x-trace-id`, W3C `traceparent`, and `x-latency-ms`
 | `POST /v1/delete` | `Writer` | Tombstone-delete a vector ID across its shard replicas. |
 | `GET /v1/topology` | `Reader` | Inspect live cluster nodes, shard epochs, primary assignments, and replica states. |
 | `GET /v1/audit` | `Admin` | Inspect hash-chained `AuditLog` entries and chain integrity verification status. |
+| `POST /v1/collections` | `Admin` | Create a named multi-tenant collection (`name`, `dimensions`, `metric`, `quantization`). |
+| `GET /v1/collections` | `Reader` | List registered collections with live vector counts and memory footprints. |
+| `DELETE /v1/collections/{name}` | `Admin` | Drop a named collection and reclaim its memory. |
+| `POST /v1/collections/{name}/upsert` | `Writer` | Tenant-isolated vector upsert within a named collection. |
+| `POST /v1/collections/{name}/search` | `Reader` | Tenant-isolated ANN search within a named collection. |
+| `POST /v1/collections/{name}/delete` | `Writer` | Tenant-isolated vector delete within a named collection. |
+| `GET /openapi.json` | Public | Live OpenAPI `3.1.0` JSON specification (see [`docs/openapi.yaml`](docs/openapi.yaml)). |
 | `GET /healthz` | Public / Probe | Kubernetes liveness probe returning JSON node & durability health. |
 | `GET /readyz` | Public / Probe | Kubernetes readiness probe (`200 OK` when quorum-ready & not draining, `503` during graceful drain). |
 | `GET /metrics` | Public / Observer | Prometheus `text/plain; version=0.0.4` cluster latency, recall, vector, and quorum counters. |
@@ -310,8 +317,9 @@ Measured locally on **Apple M5 (`aarch64-apple-darwin`, 10 cores, 24 GB unified 
 | Index Tier | Footprint | Payload Compression | `p50` Latency | `p95` Latency | `Recall@10` |
 | --- | --- | --- | --- | --- | --- |
 | **`ExactIndex` (`f32` NEON)** | `8.87 MiB` arena | `1.0x` | `0.29 ms` | `0.34 ms` | `100.00%` |
-| **`HnswIndex` (`f32` NEON)** | `9.77 MiB` total heap | `1.0x` | `0.12 ms` | `0.31 ms` | **`100.00%`** |
-| **`Sq8HnswIndex` (`u8` + `3x` Rerank)** | `3.17 MiB` total heap | **`4.0x`** | `0.15 ms` | `0.21 ms` | **`100.00%`** |
+| **`HnswIndex` (`f32` NEON)** | `9.78 MiB` total heap | `1.0x` | `0.14 ms` | `0.19 ms` | **`100.00%`** |
+| **`Fp16HnswIndex` (`f16` `binary16`, M16)** | `5.39 MiB` total heap | **`2.0x`** | `0.53 ms` | `0.59 ms` | **`100.00%`** |
+| **`Sq8HnswIndex` (`u8` + `3x` Rerank)** | `3.17 MiB` total heap | **`4.0x`** | `0.16 ms` | `0.24 ms` | **`100.00%`** |
 | **`BqIndex` (`1-bit` POPCNT + `10x` Rerank)** | `281.2 KiB` (`96 B/vec`) | **`32.0x`** | **`0.08 ms`** | **`0.11 ms`** | **`100.00%`** |
 | **`AdaptiveSearchController` (`M6`)** | Shared `HnswIndex` | `1.0x` | `0.18 ms` | `0.30 ms` | **`100.00%`** |
 | **`BqIndex` Million-Scale (`1,000,000 x 768d`)** | **`91.55 MiB`** (`2.93 GiB` `f32`) | **`32.0x`** | **`3.05 ms`** (`328 MV/s`) | **`3.88 ms`** | **`100.00%`** |
@@ -334,15 +342,21 @@ vektordist/
 │   ├── vektordist-core/              # Arenas, SIMD, HNSW, SQ8/PQ/BQ, Mmap, Hybrid, Agentic & WAL
 │   ├── vektordist-proto/             # Protobuf schema & checked-in Tonic/Prost gRPC stubs
 │   └── vektordist-cluster/           # Coordinator, Raft, ShardEngine, Snapshots, Security & Gateway
+├── clients/
+│   └── python/                       # Zero-dependency typed Python SDK (mypy --strict)
 ├── examples/                         # End-to-end runnable Rust examples (hybrid & agentic RAG)
 ├── tests/                            # Workspace-level multi-process failover E2E tests
 ├── deploy/
 │   ├── Dockerfile                    # Multi-stage distroless nonroot container build
-│   ├── k8s/statefulset.yaml          # 5-replica StatefulSet + Coordinator manifests
+│   ├── docker-compose.yml            # Turnkey 3-node + Coordinator + Gateway + Prometheus stack
+│   ├── prometheus.yml                # Prometheus 5s scrape configuration
+│   ├── k8s/statefulset.yaml          # 5-replica StatefulSet, PDB & Gateway manifests
 │   └── gcp/main.tf                   # GCP Compute Engine + pd-ssd Terraform module
 ├── docs/
 │   ├── assets/tui-dashboard.svg      # Interactive TUI dashboard capture
-│   ├── adr/                          # Architecture Decision Records (ADR-000 .. ADR-011)
+│   ├── adr/                          # Architecture Decision Records (ADR-000 .. ADR-019)
+│   ├── openapi.yaml                  # OpenAPI 3.1.0 REST gateway contract
+│   ├── OPERATIONS.md                 # Enterprise SRE & production operations runbook
 │   ├── BENCHMARKS.md                 # Hardware benchmark report & reproduction commands
 │   ├── FAILURE_MODEL.md              # Quorum durability, fencing & failure mode matrix
 │   └── THREAT_MODEL.md               # Trust boundaries, assets & zero-trust mitigations
@@ -374,6 +388,10 @@ vektordist/
   - [`ADR-013`](docs/adr/013-m13-channel-pooling-batch-gateway-and-sdk.md) — HTTP/2 gRPC Channel Pooling, Batched REST Ingestion, DoS Guards & `HttpVektorClient` SDK
   - [`ADR-014`](docs/adr/014-m14-raft-security-sync-and-persistent-audit.md) — Raft-Replicated Security Keys/Quotas & `fsync`-Backed `PersistentAuditLog`
   - [`ADR-015`](docs/adr/015-m15-production-operations-pdb-and-scale-readiness.md) — Kubernetes `PodDisruptionBudget`, `/readyz` Graceful Drain & Enterprise SRE Operations
+  - [`ADR-016`](docs/adr/016-m16-visited-pool-and-fp16-quantization.md) — Zero-Allocation Generation-Stamped `VisitedPool` & IEEE 754 `FP16` (`2x`) Quantization
+  - [`ADR-017`](docs/adr/017-m17-gateway-hardening-and-write-idempotency.md) — Modular Gateway Split, Bounded Latency Ring, Slowloris `408` Defense & `WriteId` Idempotency
+  - [`ADR-018`](docs/adr/018-m18-multi-collection-namespace-engine.md) — Multi-Collection Namespace Registry & `/v1/collections/*` API
+  - [`ADR-019`](docs/adr/019-m19-openapi-python-sdk-and-compose-stack.md) — OpenAPI 3.1 Contract, Zero-Dependency Typed Python SDK & Turnkey Docker Compose Stack
 
 ---
 

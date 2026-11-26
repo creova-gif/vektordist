@@ -1,9 +1,79 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::{Mutex, PoisonError};
 
 use crate::arena::{dot_product, l2_squared, normalize_l2, validate_vector, VectorArena};
 use crate::exact::{ScoredId, SeededRng};
 use crate::{DistanceMetric, SeqNo, VectorId, VektorError};
+
+/// Generation-stamped visited-slot table eliminating `O(N)` per-query allocations and memsets.
+///
+/// Each query increments `gen` (`O(1)`); a slot is considered visited iff `marks[slot] == gen`.
+/// Only on `u32` wraparound (`every 4,294,967,295` traversals) is `marks` cleared back to `0`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VisitedTable {
+    marks: Vec<u32>,
+    gen: u32,
+}
+
+impl VisitedTable {
+    /// Ensure `marks` covers `required_slots` and advance to a fresh non-zero generation stamp.
+    #[inline]
+    pub(crate) fn advance_and_prepare(&mut self, required_slots: usize) {
+        if self.marks.len() < required_slots {
+            self.marks.resize(required_slots, 0);
+        }
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.marks.fill(0);
+            self.gen = 1;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_visited(&self, slot: usize) -> bool {
+        self.marks.get(slot).is_some_and(|&m| m == self.gen)
+    }
+
+    #[inline]
+    pub(crate) fn mark_visited(&mut self, slot: usize) {
+        if let Some(m) = self.marks.get_mut(slot) {
+            *m = self.gen;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn capacity_slots(&self) -> usize {
+        self.marks.capacity()
+    }
+}
+
+/// RAII checkout guard that returns its `VisitedTable` to `pool` on scope exit.
+pub(crate) struct VisitedGuard<'a> {
+    pool: &'a Mutex<Vec<VisitedTable>>,
+    pub(crate) table: VisitedTable,
+}
+
+#[inline]
+pub(crate) fn checkout_visited(
+    pool: &Mutex<Vec<VisitedTable>>,
+    required_slots: usize,
+) -> VisitedGuard<'_> {
+    let mut table = {
+        let mut guard = pool.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.pop().unwrap_or_default()
+    };
+    table.advance_and_prepare(required_slots);
+    VisitedGuard { pool, table }
+}
+
+impl Drop for VisitedGuard<'_> {
+    fn drop(&mut self) {
+        let table = std::mem::take(&mut self.table);
+        let mut guard = self.pool.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.push(table);
+    }
+}
 
 /// Tunable hyperparameters for the HNSW graph index.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,8 +154,8 @@ impl PartialOrd for WorstFirst {
 }
 
 /// From-scratch Hierarchical Navigable Small World (HNSW) graph index
-/// backed by a contiguous `VectorArena` and tombstone bitset.
-#[derive(Debug, Clone)]
+/// backed by a contiguous `VectorArena`, tombstone bitset, and generation-stamped `VisitedPool`.
+#[derive(Debug)]
 pub struct HnswIndex {
     arena: VectorArena,
     metric: DistanceMetric,
@@ -97,6 +167,23 @@ pub struct HnswIndex {
     entry_point: Option<(usize, usize)>,
     /// Highest applied WAL sequence number for idempotent recovery.
     last_seq_no: SeqNo,
+    /// Reusable generation-stamped visited tables eliminating per-query `O(N)` allocations.
+    visited_pool: Mutex<Vec<VisitedTable>>,
+}
+
+impl Clone for HnswIndex {
+    fn clone(&self) -> Self {
+        Self {
+            arena: self.arena.clone(),
+            metric: self.metric,
+            params: self.params,
+            rng: self.rng.clone(),
+            layers: self.layers.clone(),
+            entry_point: self.entry_point,
+            last_seq_no: self.last_seq_no,
+            visited_pool: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl HnswIndex {
@@ -123,6 +210,7 @@ impl HnswIndex {
             layers: Vec::new(),
             entry_point: None,
             last_seq_no: 0,
+            visited_pool: Mutex::new(Vec::new()),
         })
     }
 
@@ -150,6 +238,7 @@ impl HnswIndex {
             layers: Vec::with_capacity(capacity),
             entry_point: None,
             last_seq_no: 0,
+            visited_pool: Mutex::new(Vec::new()),
         })
     }
 
@@ -189,7 +278,29 @@ impl HnswIndex {
         }
     }
 
-    /// Total heap memory in bytes used by the underlying `VectorArena` plus HNSW graph adjacency lists.
+    /// Number of reusable `VisitedTable` buffers currently parked in the pool.
+    #[must_use]
+    pub fn visited_pool_len(&self) -> usize {
+        self.visited_pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Maximum slot capacity among reusable `VisitedTable` buffers parked in the pool.
+    #[must_use]
+    pub fn visited_pool_capacity_slots(&self) -> usize {
+        self.visited_pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(VisitedTable::capacity_slots)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Total heap memory in bytes used by the underlying `VectorArena`, HNSW graph adjacency lists,
+    /// and pooled visited tables.
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         let mut graph_bytes = self.layers.capacity() * std::mem::size_of::<Vec<Vec<usize>>>();
@@ -199,7 +310,18 @@ impl HnswIndex {
                 graph_bytes += level_neighbors.capacity() * std::mem::size_of::<usize>();
             }
         }
-        self.arena.memory_bytes() + graph_bytes
+        let pool_bytes = {
+            let guard = self
+                .visited_pool
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard.capacity() * std::mem::size_of::<VisitedTable>()
+                + guard
+                    .iter()
+                    .map(|t| t.capacity_slots() * std::mem::size_of::<u32>())
+                    .sum::<usize>()
+        };
+        self.arena.memory_bytes() + graph_bytes + pool_bytes
     }
 
     /// Tombstone-delete `id` from the index.
@@ -566,8 +688,8 @@ impl HnswIndex {
             return Vec::new();
         };
         let total_slots = self.arena.slot_count();
-        let mut visited = vec![false; total_slots];
-        visited[start_slot] = true;
+        let mut visited = checkout_visited(&self.visited_pool, total_slots);
+        visited.table.mark_visited(start_slot);
 
         let start_cand = Candidate {
             slot: start_slot,
@@ -589,10 +711,10 @@ impl HnswIndex {
             if let Some(node_layers) = self.layers.get(curr.slot) {
                 if let Some(neighbors) = node_layers.get(level) {
                     for &nb_slot in neighbors {
-                        if nb_slot >= total_slots || visited[nb_slot] {
+                        if nb_slot >= total_slots || visited.table.is_visited(nb_slot) {
                             continue;
                         }
-                        visited[nb_slot] = true;
+                        visited.table.mark_visited(nb_slot);
                         let Some(nb_vec) = self.arena.vector_at_slot(nb_slot) else {
                             continue;
                         };
@@ -640,8 +762,8 @@ impl HnswIndex {
             return Vec::new();
         };
         let total_slots = self.arena.slot_count();
-        let mut visited = vec![false; total_slots];
-        visited[start_slot] = true;
+        let mut visited = checkout_visited(&self.visited_pool, total_slots);
+        visited.table.mark_visited(start_slot);
 
         let routing_ef = ef.saturating_mul(4).max(64);
         let start_cand = Candidate {
@@ -678,10 +800,10 @@ impl HnswIndex {
             if let Some(node_layers) = self.layers.get(curr.slot) {
                 if let Some(neighbors) = node_layers.get(level) {
                     for &nb_slot in neighbors {
-                        if nb_slot >= total_slots || visited[nb_slot] {
+                        if nb_slot >= total_slots || visited.table.is_visited(nb_slot) {
                             continue;
                         }
-                        visited[nb_slot] = true;
+                        visited.table.mark_visited(nb_slot);
                         let Some(nb_vec) = self.arena.vector_at_slot(nb_slot) else {
                             continue;
                         };
@@ -787,4 +909,37 @@ pub fn recall_at_k(exact_hits: &[ScoredId], approx_hits: &[ScoredId], k: usize) 
         .filter(|a| exact_top.iter().any(|e| e.id == a.id))
         .count();
     (matches as f64) / (target_k as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visited_table_generation_stamps_and_u32_wraparound_clear_stale_marks() {
+        let mut vt = VisitedTable {
+            marks: vec![u32::MAX, 1, 0, u32::MAX],
+            gen: u32::MAX - 1,
+        };
+        // Step 1: advance from u32::MAX - 1 -> u32::MAX
+        vt.advance_and_prepare(6);
+        assert_eq!(vt.gen, u32::MAX);
+        assert!(vt.is_visited(0));
+        assert!(!vt.is_visited(1));
+        assert!(!vt.is_visited(5));
+        vt.mark_visited(5);
+        assert!(vt.is_visited(5));
+
+        // Step 2: advance from u32::MAX -> wraps through 0 -> resets marks to 0 and gen = 1
+        vt.advance_and_prepare(6);
+        assert_eq!(vt.gen, 1);
+        for slot in 0..6 {
+            assert!(
+                !vt.is_visited(slot),
+                "slot {slot} must be unvisited after wraparound"
+            );
+        }
+        vt.mark_visited(2);
+        assert!(vt.is_visited(2));
+    }
 }
