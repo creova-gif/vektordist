@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Sparkline};
 use ratatui::{Frame, Terminal};
 
 use crate::cli::{ClusterMetricsSnapshot, DemoClusterSupervisor};
@@ -113,6 +113,9 @@ async fn run_tui_event_loop(
                     KeyCode::Char('a') => {
                         let _ = supervisor.add_replacement_node().await;
                     }
+                    KeyCode::Char('p') => {
+                        let _ = supervisor.toggle_pause();
+                    }
                     KeyCode::Char('r') => {
                         supervisor.shutdown();
                         *supervisor = DemoClusterSupervisor::start(
@@ -189,7 +192,12 @@ fn draw_dashboard(f: &mut Frame<'_>, snap: &ClusterMetricsSnapshot) {
         .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
         .split(chunks[1]);
 
-    let node_items: Vec<ListItem<'_>> = snap
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(4)])
+        .split(mid_chunks[1]);
+
+    let mut node_items: Vec<ListItem<'_>> = snap
         .nodes
         .iter()
         .map(|n| {
@@ -208,6 +216,10 @@ fn draw_dashboard(f: &mut Frame<'_>, snap: &ClusterMetricsSnapshot) {
             ]))
         })
         .collect();
+    node_items.push(ListItem::new(Line::from(format!(
+        " Shards: {} Healthy | {} Recovering | {} UnderQuorum",
+        snap.healthy_shards, snap.recovering_shards, snap.under_quorum_shards
+    ))));
     let nodes_list = List::new(node_items).block(
         Block::default()
             .borders(Borders::ALL)
@@ -248,13 +260,24 @@ fn draw_dashboard(f: &mut Frame<'_>, snap: &ClusterMetricsSnapshot) {
             ),
         ]),
         Line::from(format!(" Last Failover Time: {failover_str}")),
+        Line::from(format!(" Gateway: http://{}/metrics", snap.gateway_addr)),
     ];
     let metrics_panel = Paragraph::new(metrics_lines).block(
         Block::default()
             .borders(Borders::ALL)
             .title("Live Telemetry"),
     );
-    f.render_widget(metrics_panel, mid_chunks[1]);
+    f.render_widget(metrics_panel, right_chunks[0]);
+
+    let sparkline = Sparkline::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Search Latency Sparkline (us)"),
+        )
+        .data(&snap.latency_history_us)
+        .style(Style::default().fg(Color::Cyan));
+    f.render_widget(sparkline, right_chunks[1]);
 
     let event_items: Vec<ListItem<'_>> = snap
         .events
@@ -271,7 +294,7 @@ fn draw_dashboard(f: &mut Frame<'_>, snap: &ClusterMetricsSnapshot) {
     f.render_widget(events_list, chunks[2]);
 
     let footer = Paragraph::new(
-        " Keys: [k] Kill node (SIGKILL)   [a] Add replacement node   [r] Reset cluster   [q] Quit",
+        " Keys: [k] Kill node (SIGKILL)   [a] Add replacement node   [p] Pause/Resume   [r] Reset   [q] Quit",
     )
     .style(Style::default().fg(Color::Cyan))
     .block(Block::default().borders(Borders::ALL));

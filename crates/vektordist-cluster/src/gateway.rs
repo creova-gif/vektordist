@@ -1,5 +1,6 @@
-//! Milestone 10: HTTP/1.1 REST & Prometheus `/metrics` Gateway, W3C `traceparent` Distributed
-//! Trace Spans, and Automated Chaos Campaign Runner.
+//! Milestone 10 & 11: Zero-Trust HTTP/1.1 REST & Prometheus `/metrics` Gateway, Quorum REST
+//! Delete, W3C `traceparent` Distributed Trace Spans, Tamper-Evident Audit Verification, and
+//! Automated Chaos Campaign Runner.
 //!
 //! Built directly on `tokio::net::TcpListener` without external HTTP framework dependencies.
 
@@ -7,8 +8,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -23,6 +24,7 @@ use vektordist_proto::v1::topology_rpc_server::TopologyRpcServer;
 use crate::client::ClusterClient;
 use crate::coord::CoordinatorService;
 use crate::node::NodeService;
+use crate::security::{OrgId, SecurityError, SecurityGate, TenantRole};
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CHAOS_DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -260,16 +262,19 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// Zero-dependency HTTP/1.1 REST and Prometheus observability gateway backed by `ClusterClient`.
+/// Zero-dependency HTTP/1.1 REST and Prometheus observability gateway backed by `ClusterClient`,
+/// with optional zero-trust `SecurityGate` enforcement (scoped API keys, RBAC, QPS quotas, and
+/// tamper-evident hash-chained audit logging).
 #[derive(Clone)]
 pub struct HttpGatewayServer {
     client: ClusterClient,
     metrics: Arc<RwLock<PrometheusMetrics>>,
     latency_samples_ms: Arc<RwLock<Vec<f64>>>,
+    security_gate: Option<Arc<Mutex<SecurityGate>>>,
 }
 
 impl HttpGatewayServer {
-    /// Create a new `HttpGatewayServer` wrapping `client`.
+    /// Create a new `HttpGatewayServer` wrapping `client` in unauthenticated mode.
     #[must_use]
     pub fn new(client: ClusterClient) -> Self {
         Self::with_metrics(client, PrometheusMetrics::default())
@@ -282,7 +287,16 @@ impl HttpGatewayServer {
             client,
             metrics: Arc::new(RwLock::new(initial)),
             latency_samples_ms: Arc::new(RwLock::new(Vec::new())),
+            security_gate: None,
         }
+    }
+
+    /// Attach a zero-trust `SecurityGate` to enforce bearer token authentication, tenant isolation,
+    /// RBAC privilege checks, token-bucket rate limiting, and audit logging on `/v1/*` routes.
+    #[must_use]
+    pub fn with_security_gate(mut self, gate: Arc<Mutex<SecurityGate>>) -> Self {
+        self.security_gate = Some(gate);
+        self
     }
 
     /// Return a point-in-time snapshot of `PrometheusMetrics`.
@@ -399,8 +413,66 @@ impl HttpGatewayServer {
                     &text,
                 )
             }
-            ("POST", "/v1/upsert") => self.handle_upsert(body, &span, start).await,
-            ("POST", "/v1/search") => self.handle_search(body, &span, start).await,
+            ("POST", "/v1/upsert") => {
+                if let Err(denied_resp) = self.authorize_http_route(
+                    &req_headers,
+                    TenantRole::Writer,
+                    "http.upsert",
+                    &span,
+                    start,
+                ) {
+                    return denied_resp;
+                }
+                self.handle_upsert(body, &span, start).await
+            }
+            ("POST", "/v1/delete") => {
+                if let Err(denied_resp) = self.authorize_http_route(
+                    &req_headers,
+                    TenantRole::Writer,
+                    "http.delete",
+                    &span,
+                    start,
+                ) {
+                    return denied_resp;
+                }
+                self.handle_delete(body, &span, start).await
+            }
+            ("POST", "/v1/search") => {
+                if let Err(denied_resp) = self.authorize_http_route(
+                    &req_headers,
+                    TenantRole::Reader,
+                    "http.search",
+                    &span,
+                    start,
+                ) {
+                    return denied_resp;
+                }
+                self.handle_search(body, &span, start).await
+            }
+            ("GET", "/v1/topology") => {
+                if let Err(denied_resp) = self.authorize_http_route(
+                    &req_headers,
+                    TenantRole::Reader,
+                    "http.topology",
+                    &span,
+                    start,
+                ) {
+                    return denied_resp;
+                }
+                self.handle_topology(&span, start).await
+            }
+            ("GET", "/v1/audit") => {
+                if let Err(denied_resp) = self.authorize_http_route(
+                    &req_headers,
+                    TenantRole::Admin,
+                    "http.audit",
+                    &span,
+                    start,
+                ) {
+                    return denied_resp;
+                }
+                self.handle_audit(&span, start)
+            }
             _ => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                 build_http_response(
@@ -411,6 +483,60 @@ impl HttpGatewayServer {
                     latency_ms,
                     "{\"status\":\"error\",\"error\":\"route not found\"}",
                 )
+            }
+        }
+    }
+
+    fn authorize_http_route(
+        &self,
+        req_headers: &BTreeMap<String, String>,
+        required_role: TenantRole,
+        action_label: &str,
+        span: &TraceSpan,
+        start: Instant,
+    ) -> Result<(), String> {
+        let Some(gate_arc) = &self.security_gate else {
+            return Ok(());
+        };
+
+        let org_id = match req_headers.get("x-org-id") {
+            Some(raw_org) => match OrgId::new(raw_org.as_str()) {
+                Ok(org) => org,
+                Err(_) => {
+                    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let json = format!(
+                        "{{\"status\":\"error\",\"error\":\"invalid 'x-org-id' header\",\"trace_id\":\"{}\"}}",
+                        span.trace_id
+                    );
+                    return Err(build_http_response(
+                        400,
+                        "Bad Request",
+                        "application/json",
+                        span,
+                        latency_ms,
+                        &json,
+                    ));
+                }
+            },
+            None => OrgId::new("default").unwrap_or_else(|_| {
+                // Infallible for non-empty literal "default", kept panic-free.
+                unreachable!()
+            }),
+        };
+
+        let token = extract_bearer_token(req_headers);
+        let auth_result = {
+            let mut guard = gate_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.authorize_request(now_unix_ms(), token, &org_id, required_role, action_label)
+        };
+
+        match auth_result {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                Err(map_security_error_response(&err, span, latency_ms))
             }
         }
     }
@@ -529,6 +655,107 @@ impl HttpGatewayServer {
                     &resp_json,
                 )
             }
+        }
+    }
+
+    async fn handle_delete(&self, body: &str, span: &TraceSpan, start: Instant) -> String {
+        let Some(id) = extract_json_u64(body, "id") else {
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            return build_http_response(
+                400,
+                "Bad Request",
+                "application/json",
+                span,
+                latency_ms,
+                "{\"status\":\"error\",\"error\":\"missing or invalid 'id'\"}",
+            );
+        };
+        let write_id = extract_json_u64(body, "write_id").unwrap_or(id);
+
+        match self.client.delete(id, write_id).await {
+            Ok((shard_id, seq_no)) => {
+                self.update_metrics(|m| {
+                    m.indexed_vectors = m.indexed_vectors.saturating_sub(1);
+                    m.acked_writes_total = m.acked_writes_total.saturating_add(1);
+                });
+                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let resp_json = format!(
+                    "{{\"status\":\"ok\",\"shard_id\":{shard_id},\"seq_no\":{seq_no},\"trace_id\":\"{}\"}}",
+                    span.trace_id
+                );
+                build_http_response(200, "OK", "application/json", span, latency_ms, &resp_json)
+            }
+            Err(err) => {
+                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let resp_json = format!(
+                    "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
+                    escape_json_str(&err.to_string()),
+                    span.trace_id
+                );
+                build_http_response(
+                    503,
+                    "Service Unavailable",
+                    "application/json",
+                    span,
+                    latency_ms,
+                    &resp_json,
+                )
+            }
+        }
+    }
+
+    async fn handle_topology(&self, span: &TraceSpan, start: Instant) -> String {
+        let topo = match self.client.refresh_topology().await {
+            Ok(t) => t,
+            Err(_) => self.client.cached_topology(),
+        };
+        let epoch = topo.shards.iter().map(|s| s.epoch).max().unwrap_or(0);
+        let configured_nodes = topo.nodes.len() as u32;
+        let active_nodes = topo.nodes.iter().filter(|n| n.alive).count() as u32;
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let resp_json = format!(
+            "{{\"status\":\"ok\",\"epoch\":{epoch},\"num_shards\":{},\"replication_factor\":{},\"write_quorum\":{},\"dimensions\":{},\"configured_nodes\":{configured_nodes},\"active_nodes\":{active_nodes}}}",
+            topo.num_shards, topo.replication_factor, topo.write_quorum, topo.dimensions
+        );
+        build_http_response(200, "OK", "application/json", span, latency_ms, &resp_json)
+    }
+
+    fn handle_audit(&self, span: &TraceSpan, start: Instant) -> String {
+        let Some(gate_arc) = &self.security_gate else {
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            return build_http_response(
+                200,
+                "OK",
+                "application/json",
+                span,
+                latency_ms,
+                "{\"status\":\"ok\",\"security_enabled\":false,\"entries_count\":0,\"head_hash\":0,\"chain_valid\":true}",
+            );
+        };
+
+        let (verify_res, head_hash) = {
+            let guard = gate_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                guard.audit_log.verify_integrity(),
+                guard.audit_log.head_hash(),
+            )
+        };
+
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        match verify_res {
+            Ok(entries_count) => {
+                let resp_json = format!(
+                    "{{\"status\":\"ok\",\"security_enabled\":true,\"entries_count\":{entries_count},\"head_hash\":{head_hash},\"chain_valid\":true}}"
+                );
+                build_http_response(200, "OK", "application/json", span, latency_ms, &resp_json)
+            }
+            Err(corrupted_seq_no) => map_security_error_response(
+                &SecurityError::AuditIntegrityViolation { corrupted_seq_no },
+                span,
+                latency_ms,
+            ),
         }
     }
 }
@@ -659,6 +886,106 @@ fn split_http_head_and_body(raw: &str) -> (&str, &str) {
     }
 }
 
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn extract_bearer_token(headers: &BTreeMap<String, String>) -> &str {
+    let Some(raw) = headers.get("authorization") else {
+        return "";
+    };
+    let trimmed = raw.trim();
+    if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+    {
+        trimmed.get(7..).map_or("", str::trim)
+    } else {
+        ""
+    }
+}
+
+fn map_security_error_response(err: &SecurityError, span: &TraceSpan, latency_ms: f64) -> String {
+    let escaped = escape_json_str(&err.to_string());
+    match err {
+        SecurityError::Unauthorized => {
+            let body = format!(
+                "{{\"status\":\"error\",\"error\":\"{escaped}\",\"trace_id\":\"{}\"}}",
+                span.trace_id
+            );
+            build_http_response(
+                401,
+                "Unauthorized",
+                "application/json",
+                span,
+                latency_ms,
+                &body,
+            )
+        }
+        SecurityError::CrossTenantDenied { .. } | SecurityError::InsufficientRole { .. } => {
+            let body = format!(
+                "{{\"status\":\"error\",\"error\":\"{escaped}\",\"trace_id\":\"{}\"}}",
+                span.trace_id
+            );
+            build_http_response(
+                403,
+                "Forbidden",
+                "application/json",
+                span,
+                latency_ms,
+                &body,
+            )
+        }
+        SecurityError::RateLimited { retry_after_ms, .. } => {
+            let retry_secs = retry_after_ms.div_ceil(1000).max(1);
+            let retry_secs_str = retry_secs.to_string();
+            let body = format!(
+                "{{\"status\":\"error\",\"error\":\"{escaped}\",\"retry_after_ms\":{retry_after_ms},\"trace_id\":\"{}\"}}",
+                span.trace_id
+            );
+            build_http_response_with_headers(
+                429,
+                "Too Many Requests",
+                "application/json",
+                span,
+                latency_ms,
+                &[("Retry-After", &retry_secs_str)],
+                &body,
+            )
+        }
+        SecurityError::StorageQuotaExceeded { .. } => {
+            let body = format!(
+                "{{\"status\":\"error\",\"error\":\"{escaped}\",\"trace_id\":\"{}\"}}",
+                span.trace_id
+            );
+            build_http_response(
+                507,
+                "Insufficient Storage",
+                "application/json",
+                span,
+                latency_ms,
+                &body,
+            )
+        }
+        SecurityError::AuditIntegrityViolation { .. } => {
+            let body = format!(
+                "{{\"status\":\"error\",\"error\":\"{escaped}\",\"trace_id\":\"{}\"}}",
+                span.trace_id
+            );
+            build_http_response(
+                500,
+                "Internal Server Error",
+                "application/json",
+                span,
+                latency_ms,
+                &body,
+            )
+        }
+    }
+}
+
 fn build_http_response(
     status_code: u16,
     reason: &str,
@@ -667,12 +994,38 @@ fn build_http_response(
     latency_ms: f64,
     body: &str,
 ) -> String {
-    format!(
-        "HTTP/1.1 {status_code} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nx-trace-id: {}\r\ntraceparent: {}\r\nx-latency-ms: {latency_ms:.3}\r\nconnection: close\r\n\r\n{body}",
+    build_http_response_with_headers(
+        status_code,
+        reason,
+        content_type,
+        span,
+        latency_ms,
+        &[],
+        body,
+    )
+}
+
+fn build_http_response_with_headers(
+    status_code: u16,
+    reason: &str,
+    content_type: &str,
+    span: &TraceSpan,
+    latency_ms: f64,
+    extra_headers: &[(&str, &str)],
+    body: &str,
+) -> String {
+    let mut out = format!(
+        "HTTP/1.1 {status_code} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nx-trace-id: {}\r\ntraceparent: {}\r\nx-latency-ms: {latency_ms:.3}\r\n",
         body.len(),
         span.trace_id,
         span.to_traceparent(),
-    )
+    );
+    for &(k, v) in extra_headers {
+        let _ = write!(out, "{k}: {v}\r\n");
+    }
+    out.push_str("connection: close\r\n\r\n");
+    out.push_str(body);
+    out
 }
 
 fn parse_http_response(raw: &str) -> Result<HttpResponse, VektorError> {
@@ -1206,5 +1559,88 @@ mod tests {
         assert!(text.contains("vektordist_recall_at_10 0.9850"));
         assert!(text.contains("# TYPE vektordist_acked_writes_lost_total counter"));
         assert!(text.contains("vektordist_acked_writes_lost_total 0"));
+    }
+
+    #[test]
+    fn bearer_extraction_and_security_error_http_mappings_cover_all_variants() {
+        let mut headers = BTreeMap::new();
+        assert_eq!(extract_bearer_token(&headers), "");
+        headers.insert("authorization".to_string(), "BEARER vdk.k1.abc".to_string());
+        assert_eq!(extract_bearer_token(&headers), "vdk.k1.abc");
+        headers.insert("authorization".to_string(), "Basic xyz".to_string());
+        assert_eq!(extract_bearer_token(&headers), "");
+
+        let span = TraceSpan::new_root(42);
+        let org_a = OrgId::new("org-a").unwrap();
+        let org_b = OrgId::new("org-b").unwrap();
+
+        let r401 = parse_http_response(&map_security_error_response(
+            &SecurityError::Unauthorized,
+            &span,
+            1.0,
+        ))
+        .unwrap();
+        assert_eq!(r401.status_code, 401);
+
+        let r403_tenant = parse_http_response(&map_security_error_response(
+            &SecurityError::CrossTenantDenied {
+                key_org: org_a.clone(),
+                target_org: org_b,
+            },
+            &span,
+            1.0,
+        ))
+        .unwrap();
+        assert_eq!(r403_tenant.status_code, 403);
+
+        let r403_role = parse_http_response(&map_security_error_response(
+            &SecurityError::InsufficientRole {
+                actual: TenantRole::Reader,
+                required: TenantRole::Admin,
+            },
+            &span,
+            1.0,
+        ))
+        .unwrap();
+        assert_eq!(r403_role.status_code, 403);
+
+        let r429 = parse_http_response(&map_security_error_response(
+            &SecurityError::RateLimited {
+                org_id: org_a.clone(),
+                retry_after_ms: 250,
+            },
+            &span,
+            1.0,
+        ))
+        .unwrap();
+        assert_eq!(r429.status_code, 429);
+        assert_eq!(
+            r429.headers.get("retry-after").map(String::as_str),
+            Some("1")
+        );
+
+        let r507 = parse_http_response(&map_security_error_response(
+            &SecurityError::StorageQuotaExceeded {
+                org_id: org_a,
+                current_vectors: 11,
+                max_vectors: 10,
+                current_bytes: 1024,
+                max_bytes: 512,
+            },
+            &span,
+            1.0,
+        ))
+        .unwrap();
+        assert_eq!(r507.status_code, 507);
+
+        let r500 = parse_http_response(&map_security_error_response(
+            &SecurityError::AuditIntegrityViolation {
+                corrupted_seq_no: 7,
+            },
+            &span,
+            1.0,
+        ))
+        .unwrap();
+        assert_eq!(r500.status_code, 500);
     }
 }

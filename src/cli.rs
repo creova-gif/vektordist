@@ -12,6 +12,7 @@ use tonic::transport::Server;
 use tonic::Request;
 use vektordist_cluster::client::ClusterClient;
 use vektordist_cluster::coord::CoordinatorService;
+use vektordist_cluster::gateway::{spawn_http_gateway, HttpGatewayServer, PrometheusMetrics};
 use vektordist_cluster::node::{format_endpoint, NodeService};
 use vektordist_cluster::{u32_to_shard_state, ShardState};
 use vektordist_core::arena::dot_product;
@@ -132,6 +133,12 @@ pub struct ClusterMetricsSnapshot {
     pub write_quorum: u8,
     pub cluster_status: String,
     pub degraded_under_quorum: bool,
+    pub paused: bool,
+    pub gateway_addr: String,
+    pub healthy_shards: usize,
+    pub recovering_shards: usize,
+    pub under_quorum_shards: usize,
+    pub latency_history_us: Vec<u64>,
     pub recall_at_10: f64,
     pub latency_p50_ms: f64,
     pub latency_p95_ms: f64,
@@ -197,7 +204,9 @@ pub struct DemoClusterSupervisor {
     pub keep_data: bool,
     pub coord: CoordinatorService,
     pub coord_addr: String,
+    pub gateway_addr: String,
     pub client: ClusterClient,
+    gateway: HttpGatewayServer,
     children: Arc<Mutex<BTreeMap<NodeId, ChildNodeProcess>>>,
     next_node_id: AtomicU64,
     next_vector_id: Arc<AtomicU64>,
@@ -205,9 +214,11 @@ pub struct DemoClusterSupervisor {
     ledger: Arc<Mutex<WriteIdLedger>>,
     evaluator: Arc<RwLock<LiveRecallEvaluator>>,
     metrics: Arc<Mutex<SharedMetrics>>,
+    paused: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
     coord_handle: JoinHandle<()>,
+    gateway_handle: JoinHandle<()>,
 }
 
 impl DemoClusterSupervisor {
@@ -281,6 +292,9 @@ impl DemoClusterSupervisor {
         });
 
         let client = ClusterClient::connect(&coord_addr).await?;
+        let gateway = HttpGatewayServer::new(client.clone());
+        let (gateway_addr, gateway_handle) =
+            spawn_http_gateway("127.0.0.1:0", gateway.clone()).await?;
         let eval_queries = 50_usize;
         let mut evaluator = LiveRecallEvaluator::new(eval_queries, dimensions, 10, seed);
         let mut ledger = WriteIdLedger::default();
@@ -314,6 +328,9 @@ impl DemoClusterSupervisor {
         metrics_init.log_event(format!(
             "[OK] {nodes} nodes healthy; {initial_vectors} vectors indexed (seed={seed})."
         ));
+        metrics_init.log_event(format!(
+            "[GATEWAY] HTTP/Prometheus endpoint online at http://{gateway_addr}/metrics"
+        ));
 
         let sup = Arc::new(Self {
             config,
@@ -322,7 +339,9 @@ impl DemoClusterSupervisor {
             keep_data,
             coord,
             coord_addr,
+            gateway_addr,
             client,
+            gateway,
             children: Arc::new(Mutex::new(child_map)),
             next_node_id: AtomicU64::new(u64::from(nodes) + 1),
             next_vector_id: Arc::new(AtomicU64::new((initial_vectors as u64) + 1)),
@@ -330,13 +349,37 @@ impl DemoClusterSupervisor {
             ledger: Arc::new(Mutex::new(ledger)),
             evaluator: Arc::new(RwLock::new(evaluator)),
             metrics: Arc::new(Mutex::new(metrics_init)),
+            paused: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             worker_handles: Mutex::new(Vec::new()),
             coord_handle,
+            gateway_handle,
         });
 
+        let _ = sup.metrics_snapshot();
         sup.start_background_workers();
         Ok(sup)
+    }
+
+    /// Toggle continuous search + write background load (`[p]` key in TUI).
+    /// Returns the new `paused` state (`true` if now paused).
+    pub fn toggle_pause(&self) -> bool {
+        let prev = self.paused.fetch_xor(true, Ordering::SeqCst);
+        let now_paused = !prev;
+        if let Ok(mut m) = self.metrics.lock() {
+            if now_paused {
+                m.log_event("[PAUSE] Continuous search & write load paused.");
+            } else {
+                m.log_event("[RESUME] Continuous search & write load resumed.");
+            }
+        }
+        now_paused
+    }
+
+    /// Whether continuous background load is currently paused.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     fn start_background_workers(self: &Arc<Self>) {
@@ -348,6 +391,10 @@ impl DemoClusterSupervisor {
             handles.push(tokio::spawn(async move {
                 let mut q_cursor = client_idx;
                 while !sup.stop_flag.load(Ordering::Relaxed) {
+                    if sup.paused.load(Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
                     let query_opt = {
                         let Ok(eval_guard) = sup.evaluator.read() else {
                             break;
@@ -389,6 +436,10 @@ impl DemoClusterSupervisor {
                 let mut rng = SeededRng::new(999_999);
                 let mut vec_buf = vec![0.0_f32; sup.config.dimensions];
                 while !sup.stop_flag.load(Ordering::Relaxed) {
+                    if sup.paused.load(Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
                     rng.fill_unit_vector(&mut vec_buf);
                     let vec_id = sup.next_vector_id.fetch_add(1, Ordering::SeqCst);
                     let write_id = sup.next_write_id.fetch_add(1, Ordering::SeqCst);
@@ -578,6 +629,18 @@ impl DemoClusterSupervisor {
         let topo = self.coord.build_topology_response();
         let configured_nodes = topo.nodes.len() as u32;
         let active_nodes = topo.nodes.iter().filter(|n| n.alive).count() as u32;
+        let paused = self.is_paused();
+
+        let mut healthy_shards = 0_usize;
+        let mut recovering_shards = 0_usize;
+        let mut under_quorum_shards = 0_usize;
+        for shard in &topo.shards {
+            match u32_to_shard_state(shard.state) {
+                ShardState::Healthy | ShardState::DegradedOk => healthy_shards += 1,
+                ShardState::Recovering | ShardState::Reconciling => recovering_shards += 1,
+                ShardState::UnderQuorum => under_quorum_shards += 1,
+            }
+        }
 
         let Ok(m) = self.metrics.lock() else {
             return ClusterMetricsSnapshot {
@@ -589,6 +652,12 @@ impl DemoClusterSupervisor {
                 write_quorum: self.config.write_quorum,
                 cluster_status: "UNKNOWN".to_string(),
                 degraded_under_quorum: false,
+                paused,
+                gateway_addr: self.gateway_addr.clone(),
+                healthy_shards,
+                recovering_shards,
+                under_quorum_shards,
+                latency_history_us: Vec::new(),
                 recall_at_10: 1.0,
                 latency_p50_ms: 0.0,
                 latency_p95_ms: 0.0,
@@ -608,6 +677,15 @@ impl DemoClusterSupervisor {
         let p95 = percentile(&sorted_lat, 95.0);
         let p99 = percentile(&sorted_lat, 99.0);
 
+        let history_len = m.latency_samples_ms.len();
+        let skip = history_len.saturating_sub(40);
+        let latency_history_us: Vec<u64> = m
+            .latency_samples_ms
+            .iter()
+            .skip(skip)
+            .map(|ms| (ms * 1000.0).round().max(1.0) as u64)
+            .collect();
+
         let recall_mean = if m.recall_samples.is_empty() {
             1.0
         } else {
@@ -616,8 +694,22 @@ impl DemoClusterSupervisor {
         let elapsed_s = m.started_at.elapsed().as_secs_f64().max(0.001);
         let qps = (m.total_searches as f64) / elapsed_s;
 
+        self.gateway.update_metrics(|gm: &mut PrometheusMetrics| {
+            gm.active_nodes = active_nodes;
+            gm.configured_nodes = configured_nodes;
+            gm.indexed_vectors = m.indexed_vectors as u64;
+            gm.search_latency_p50_ms = p50;
+            gm.search_latency_p95_ms = p95;
+            gm.search_latency_p99_ms = p99;
+            gm.recall_at_10 = recall_mean;
+            gm.acked_writes_total = m.acked_writes as u64;
+            gm.acked_writes_lost_total = m.acked_writes_lost as u64;
+        });
+
         let cluster_status = if m.degraded_under_quorum {
             "DEGRADED (under-quorum, reads only)".to_string()
+        } else if paused {
+            "PAUSED (load suspended)".to_string()
         } else if active_nodes < configured_nodes {
             "Online (degraded replica set, W=2 active)".to_string()
         } else {
@@ -633,6 +725,12 @@ impl DemoClusterSupervisor {
             write_quorum: self.config.write_quorum,
             cluster_status,
             degraded_under_quorum: m.degraded_under_quorum,
+            paused,
+            gateway_addr: self.gateway_addr.clone(),
+            healthy_shards,
+            recovering_shards,
+            under_quorum_shards,
+            latency_history_us,
             recall_at_10: recall_mean,
             latency_p50_ms: p50,
             latency_p95_ms: p95,
@@ -654,6 +752,7 @@ impl DemoClusterSupervisor {
                 h.abort();
             }
         }
+        self.gateway_handle.abort();
         self.coord_handle.abort();
         if let Ok(mut map) = self.children.lock() {
             for entry in map.values_mut() {

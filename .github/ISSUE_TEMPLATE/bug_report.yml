@@ -1,0 +1,89 @@
+name: Bug Report
+description: Report a reproducible bug, consensus/failover edge case, recall regression, or crash in VektorDist.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue in **VektorDist**!
+        > **Security Note:** If this issue involves a security vulnerability (authentication bypass, cross-tenant leakage, audit tampering, or memory unsafety), please report it privately via [SECURITY.md](../../SECURITY.md) instead of opening a public issue.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Bug Summary
+      description: Concise description of the defect and which invariant failed.
+      placeholder: "After killing 2 replicas rapidly during shard rebalancing, follower node-4 returned STATUS_WRONG_EPOCH..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Affected Subsystem
+      options:
+        - "vektordist-core (HNSW / SIMD / Quantization / WAL / Mmap)"
+        - "vektordist-core (Hybrid BM25+RRF / Multi-Tenant / Agentic / ColBERT)"
+        - "vektordist-cluster (Coordinator / Raft / Failover / Rebalancing)"
+        - "vektordist-cluster (HTTP Gateway / SecurityGate / Prometheus / Chaos)"
+        - "vektordist-cluster (Snapshots / Backup & Restore)"
+        - "vektordist CLI / Ratatui TUI"
+        - "Deploy (Docker / Kubernetes / Terraform / Release CI)"
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: OS & CPU Architecture
+      description: Operating system, kernel, and CPU/SIMD architecture (e.g., macOS 15.2 arm64 Apple M5, Ubuntu 24.04 x86_64).
+      placeholder: "macOS 15.2 (aarch64-apple-darwin, Apple Silicon)"
+    validations:
+      required: true
+
+  - type: input
+    id: toolchain
+    attributes:
+      label: Rust Toolchain & VektorDist Version
+      description: Output of `rustc --version` and `vektordist --version` (or commit SHA).
+      placeholder: "rustc 1.85.0 / vektordist 0.1.0 (main)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Deterministic Reproduction Command & Seed
+      description: Exact CLI invocation, `--seed`, config file, or minimal Rust test to reproduce the issue.
+      placeholder: |
+        cargo run --release -- chaos --nodes 5 --vectors 2000 --dimensions 128 --seed 42
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: cluster_topology
+    attributes:
+      label: Cluster Topology & Configuration
+      description: Number of nodes, shards, replication factor (`RF`), write quorum (`W`), vector dimensions, and quantization mode.
+      placeholder: "5 nodes, 16 shards, RF=3, W=2, 768d Cosine, SQ8 enabled"
+    validations:
+      required: false
+
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: Expected vs. Actual Behavior
+      description: State the expected invariant (e.g., `acked_writes_lost == 0`, `recall@10 >= 0.95`) vs. what actually occurred.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, Stack Trace, or Metrics Output
+      description: Paste relevant terminal output, `/metrics` scrape, or test failure output.
+      render: text
+    validations:
+      required: false

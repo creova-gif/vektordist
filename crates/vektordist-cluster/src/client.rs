@@ -16,7 +16,7 @@ use vektordist_proto::v1::{
 };
 use vektordist_proto::{
     encode_f32_le, from_wire_scored_id, from_wire_wal_record, to_wire_wal_record, STATUS_OK,
-    STATUS_QUORUM_UNAVAILABLE, STATUS_WRONG_EPOCH, WIRE_OP_UPSERT,
+    STATUS_QUORUM_UNAVAILABLE, STATUS_WRONG_EPOCH, WIRE_OP_DELETE, WIRE_OP_UPSERT,
 };
 
 use crate::node::format_endpoint;
@@ -83,8 +83,6 @@ impl ClusterClient {
         write_id: WriteId,
         vector: &[f32],
     ) -> Result<(ShardId, SeqNo), VektorError> {
-        let cfg = self.cluster_config();
-        let shard_id = cfg.shard_for(id);
         let wire_rec = WireWalRecord {
             seq_no: 0,
             write_id,
@@ -92,6 +90,36 @@ impl ClusterClient {
             vector_id: id,
             vector_f32_le: encode_f32_le(vector),
         };
+        self.append_single_quorum_record(id, wire_rec, "upsert")
+            .await
+    }
+
+    /// Perform a single durable `W=2` quorum delete routed directly to the shard primary.
+    /// Automatically refreshes topology and retries once on `WRONG_EPOCH` or primary failure.
+    pub async fn delete(
+        &self,
+        id: VectorId,
+        write_id: WriteId,
+    ) -> Result<(ShardId, SeqNo), VektorError> {
+        let wire_rec = WireWalRecord {
+            seq_no: 0,
+            write_id,
+            op_kind: WIRE_OP_DELETE,
+            vector_id: id,
+            vector_f32_le: Vec::new(),
+        };
+        self.append_single_quorum_record(id, wire_rec, "delete")
+            .await
+    }
+
+    async fn append_single_quorum_record(
+        &self,
+        id: VectorId,
+        wire_rec: WireWalRecord,
+        op_name: &str,
+    ) -> Result<(ShardId, SeqNo), VektorError> {
+        let cfg = self.cluster_config();
+        let shard_id = cfg.shard_for(id);
 
         for attempt in 0..2 {
             let Some(shard) = self.get_shard_assignment(shard_id) else {
@@ -143,7 +171,7 @@ impl ClusterClient {
         }
 
         Err(VektorError::WalIo(format!(
-            "upsert failed after topology refresh on shard {shard_id}"
+            "{op_name} failed after topology refresh on shard {shard_id}"
         )))
     }
 
