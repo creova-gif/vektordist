@@ -2,11 +2,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod adaptive;
+pub mod agentic;
 pub mod arena;
 pub mod exact;
 pub mod hnsw;
 pub mod hybrid;
 pub mod mmap;
+pub mod pq_bq;
 pub mod quant;
 pub mod simd;
 pub mod wal;
