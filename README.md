@@ -194,9 +194,15 @@ vektordist snapshot restore \
   --target-dir /var/lib/vektordist/node-1-restored
 ```
 
-### Release Benchmarks, Chaos SLA Runner & End-to-End Agent RAG Example
+### Preflight Diagnostics, Million-Vector Scale Benchmarks & Agent RAG Example
 
 ```bash
+# Run preflight SIMD, config, WAL fsync durability & network diagnostics
+vektordist doctor
+
+# Run 1,000,000 x 768d streaming Binary Quantization (32x, ~91.5 MiB payload) scale benchmark
+vektordist bench-scale --vectors 1000000 --dimensions 768 --queries 20
+
 # Run Exact, HNSW (f32), SQ8 (4x), BQ (32x) & Adaptive M6 latency/recall benchmark suite
 vektordist bench --vectors 100000 --dimensions 768 --seed 42 --queries 20 --top-k 10
 
@@ -211,16 +217,18 @@ cargo run --example quickstart_hybrid_agent_rag
 
 ## Authenticated HTTP/1.1 REST & Prometheus API Reference
 
-Every HTTP response includes `x-trace-id`, W3C `traceparent`, and `x-latency-ms` headers. When `SecurityGate` enforcement is enabled on the gateway, protected `/v1/*` routes verify constant-time `Authorization: Bearer vdk.<key_id>.<hex_tag>` credentials, enforce `X-Org-Id` tenant binding and token-bucket rate quotas, and record an immutable entry in `AuditLog`.
+Every HTTP response includes `x-trace-id`, W3C `traceparent`, and `x-latency-ms` headers, guarded by a configurable `max_body_bytes` DoS ceiling (`413 Payload Too Large`). When `SecurityGate` enforcement is enabled on the gateway, protected `/v1/*` routes verify constant-time `Authorization: Bearer vdk.<key_id>.<hex_tag>` credentials, enforce `X-Org-Id` tenant binding and token-bucket rate quotas, and record an immutable entry in `AuditLog`. Typed Rust callers can also use `vektordist_cluster::sdk::HttpVektorClient`.
 
 | Method & Path | Required Role | Description |
 | --- | --- | --- |
 | `POST /v1/upsert` | `Writer` | Quorum-write (`W=2`) a vector with `id`, optional `write_id`, and `vector` payload. |
+| `POST /v1/upsert_batch` | `Writer` | Partition and quorum-write (`W=2`, `1 fsync` per shard) a multi-vector batch. |
 | `POST /v1/search` | `Reader` | Scatter-gather ANN search (`query`, `top_k`, `ef_search`) returning ranked `(id, score)` hits. |
 | `POST /v1/delete` | `Writer` | Tombstone-delete a vector ID across its shard replicas. |
 | `GET /v1/topology` | `Reader` | Inspect live cluster nodes, shard epochs, primary assignments, and replica states. |
 | `GET /v1/audit` | `Admin` | Inspect hash-chained `AuditLog` entries and chain integrity verification status. |
-| `GET /healthz` | Public / Probe | Kubernetes readiness/liveness probe returning JSON node & durability health. |
+| `GET /healthz` | Public / Probe | Kubernetes liveness probe returning JSON node & durability health. |
+| `GET /readyz` | Public / Probe | Kubernetes readiness probe (`200 OK` when quorum-ready & not draining, `503` during graceful drain). |
 | `GET /metrics` | Public / Observer | Prometheus `text/plain; version=0.0.4` cluster latency, recall, vector, and quorum counters. |
 
 ### `curl` Examples
@@ -306,6 +314,7 @@ Measured locally on **Apple M5 (`aarch64-apple-darwin`, 10 cores, 24 GB unified 
 | **`Sq8HnswIndex` (`u8` + `3x` Rerank)** | `3.17 MiB` total heap | **`4.0x`** | `0.15 ms` | `0.21 ms` | **`100.00%`** |
 | **`BqIndex` (`1-bit` POPCNT + `10x` Rerank)** | `281.2 KiB` (`96 B/vec`) | **`32.0x`** | **`0.08 ms`** | **`0.11 ms`** | **`100.00%`** |
 | **`AdaptiveSearchController` (`M6`)** | Shared `HnswIndex` | `1.0x` | `0.18 ms` | `0.30 ms` | **`100.00%`** |
+| **`BqIndex` Million-Scale (`1,000,000 x 768d`)** | **`91.55 MiB`** (`2.93 GiB` `f32`) | **`32.0x`** | **`3.05 ms`** (`328 MV/s`) | **`3.88 ms`** | **`100.00%`** |
 
 ### Distributed 5-Node Fault-Injection & Quorum Durability SLA
 
@@ -344,6 +353,7 @@ vektordist/
 
 ## Architecture Decision Records & Core Docs
 
+- **Production SRE Operations Runbook:** [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
 - **Failure Model & Consistency Guarantees:** [`docs/FAILURE_MODEL.md`](docs/FAILURE_MODEL.md)
 - **Benchmark Report & Hardware Reproduction:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
 - **Security Threat Model:** [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md)
@@ -360,6 +370,10 @@ vektordist/
   - [`ADR-009`](docs/adr/009-m9-agentic-memory-colbert-and-semantic-cache.md) — Programmable Agentic Memory, ColBERT `MaxSim` Late Interaction & Semantic Cache
   - [`ADR-010`](docs/adr/010-m10-http-gateway-prometheus-and-chaos-runner.md) — HTTP/1.1 REST & Prometheus Gateway, W3C `traceparent` Spans & Chaos Campaign Runner
   - [`ADR-011`](docs/adr/011-m11-authenticated-gateway-and-product-completion.md) — Declarative Node Configuration, Authenticated Gateway Endpoints, Keygen CLI & Production Release Readiness
+  - [`ADR-012`](docs/adr/012-m12-atomic-wal-checkpointing-and-log-compaction.md) — Atomic CRC32 Shard Checkpointing (`VDCK`/`VDSG`) & Crash-Safe WAL Truncation
+  - [`ADR-013`](docs/adr/013-m13-channel-pooling-batch-gateway-and-sdk.md) — HTTP/2 gRPC Channel Pooling, Batched REST Ingestion, DoS Guards & `HttpVektorClient` SDK
+  - [`ADR-014`](docs/adr/014-m14-raft-security-sync-and-persistent-audit.md) — Raft-Replicated Security Keys/Quotas & `fsync`-Backed `PersistentAuditLog`
+  - [`ADR-015`](docs/adr/015-m15-production-operations-pdb-and-scale-readiness.md) — Kubernetes `PodDisruptionBudget`, `/readyz` Graceful Drain & Enterprise SRE Operations
 
 ---
 

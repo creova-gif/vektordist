@@ -344,7 +344,7 @@ impl PersistentVectorSegment {
     }
 
     #[must_use]
-    pub fn crc32(&self) -> u32 {
+    pub const fn crc32(&self) -> u32 {
         self.crc32
     }
 

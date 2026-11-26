@@ -74,6 +74,29 @@ metric = "cosine"
     let bench_stdout = String::from_utf8_lossy(&bench_out.stdout);
     assert!(bench_stdout.contains("VektorDist M1–M10 Benchmark Suite"));
     assert!(bench_stdout.contains("bq   (1b"));
+
+    // Verify `vektordist doctor` preflight diagnostics pass end-to-end.
+    let doctor_out = Command::new(&bin).args(["doctor"]).output().unwrap();
+    assert!(doctor_out.status.success());
+    let doctor_stdout = String::from_utf8_lossy(&doctor_out.stdout);
+    assert!(doctor_stdout.contains("status: HEALTHY"));
+
+    // Verify `vektordist bench-scale` streaming BQ 32x benchmark executes cleanly.
+    let scale_out = Command::new(&bin)
+        .args([
+            "bench-scale",
+            "--vectors",
+            "1000",
+            "--dimensions",
+            "128",
+            "--queries",
+            "4",
+        ])
+        .output()
+        .unwrap();
+    assert!(scale_out.status.success());
+    let scale_stdout = String::from_utf8_lossy(&scale_out.stdout);
+    assert!(scale_stdout.contains("32.0x compression"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

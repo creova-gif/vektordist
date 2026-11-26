@@ -164,6 +164,79 @@ impl WalLog {
         &self.path
     }
 
+    /// Return the current durable byte length of the underlying WAL file.
+    pub fn file_size_bytes(&self) -> Result<u64, VektorError> {
+        let meta = self
+            .file
+            .metadata()
+            .map_err(|e| VektorError::WalIo(e.to_string()))?;
+        Ok(meta.len())
+    }
+
+    /// Atomically compact the WAL so it contains only `retained_records` encoded as valid
+    /// `b"VDWL"` CRC32 frames.
+    ///
+    /// Crash-safety protocol:
+    /// 1. Encodes `retained_records` and writes them to sibling `<wal_path>.compact.tmp`.
+    /// 2. Calls `sync_all()` on the temporary file before closing it.
+    /// 3. Atomically `std::fs::rename`s `<wal_path>.compact.tmp` over `self.path` (if killed
+    ///    prior to rename, the original WAL remains completely intact).
+    /// 4. Syncs the parent directory if supported, reopens `self.file` positioned at
+    ///    `SeekFrom::End(0)`, and returns the new WAL file byte length.
+    pub fn compact_to(&mut self, retained_records: &[WalRecord]) -> Result<u64, VektorError> {
+        let mut encoded =
+            Vec::with_capacity(retained_records.len() * (HEADER_LEN + 28 + self.dims * 4));
+        for rec in retained_records {
+            let frame = encode_frame(rec, self.dims)?;
+            encoded.extend_from_slice(&frame);
+        }
+
+        let mut tmp_os = self.path.as_os_str().to_os_string();
+        tmp_os.push(".compact.tmp");
+        let tmp_path = PathBuf::from(tmp_os);
+
+        {
+            let mut tmp_file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)
+                .map_err(|e| VektorError::WalIo(e.to_string()))?;
+            if !encoded.is_empty() {
+                tmp_file
+                    .write_all(&encoded)
+                    .map_err(|e| VektorError::WalIo(e.to_string()))?;
+            }
+            tmp_file
+                .sync_all()
+                .map_err(|e| VektorError::WalIo(e.to_string()))?;
+        }
+
+        std::fs::rename(&tmp_path, &self.path).map_err(|e| VektorError::WalIo(e.to_string()))?;
+
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Ok(dir) = File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
+
+        let mut reopened = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)
+            .map_err(|e| VektorError::WalIo(e.to_string()))?;
+        reopened
+            .seek(SeekFrom::End(0))
+            .map_err(|e| VektorError::WalIo(e.to_string()))?;
+        self.file = reopened;
+        self.file_size_bytes()
+    }
+
     /// Append a single `WalRecord` and immediately call `sync_data()` (`fsync`).
     pub fn append_and_sync(&mut self, record: &WalRecord) -> Result<(), VektorError> {
         let frame = encode_frame(record, self.dims)?;

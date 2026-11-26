@@ -4,8 +4,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 pub use vektordist_core::hybrid::OrgId;
+use vektordist_core::VektorError;
 
 /// Role-based access control (RBAC) privilege tier assigned to a tenant-scoped API key.
 ///
@@ -565,6 +569,354 @@ impl AuditLog {
     }
 }
 
+const AUDIT_FRAME_MAGIC: [u8; 4] = *b"VAUD";
+const AUDIT_FRAME_HEADER_LEN: usize = 12;
+
+/// Durable `fsync`-backed wrapper around [`AuditLog`] storing CRC32-framed, hash-chained
+/// [`AuditEntry`] records on disk.
+///
+/// Any byte flip, truncation, reordering, or deleted frame on disk is deterministically rejected
+/// with [`VektorError::WalCorruption`] on [`PersistentAuditLog::open`] or
+/// [`PersistentAuditLog::reopen_and_verify`].
+#[derive(Debug)]
+pub struct PersistentAuditLog {
+    path: PathBuf,
+    file: File,
+    inner: AuditLog,
+}
+
+impl PersistentAuditLog {
+    /// Open or create a persistent audit log at `path`, verifying all existing frames and the
+    /// genesis-anchored hash chain if the file is non-empty.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, VektorError> {
+        let path_buf = path.as_ref().to_path_buf();
+        if let Some(parent) = path_buf.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| VektorError::WalIo(e.to_string()))?;
+            }
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path_buf)
+            .map_err(|e| VektorError::WalIo(e.to_string()))?;
+        let inner = read_and_verify_audit_file(&mut file)?;
+        Ok(Self {
+            path: path_buf,
+            file,
+            inner,
+        })
+    }
+
+    /// Reopen an existing audit log at `path` and verify every byte, CRC32 checksum, sequence
+    /// number, and chained cryptographic digest from genesis.
+    pub fn reopen_and_verify(path: impl AsRef<Path>) -> Result<Self, VektorError> {
+        let path_buf = path.as_ref().to_path_buf();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path_buf)
+            .map_err(|e| VektorError::WalIo(e.to_string()))?;
+        let inner = read_and_verify_audit_file(&mut file)?;
+        Ok(Self {
+            path: path_buf,
+            file,
+            inner,
+        })
+    }
+
+    /// Append a new [`AuditEntry`], write its length-prefixed CRC32 frame to disk, `fsync`
+    /// (`sync_data`), and commit it to the in-memory hash chain.
+    pub fn append_and_sync(
+        &mut self,
+        timestamp_ms: u64,
+        actor_key_id: impl Into<String>,
+        org_id: OrgId,
+        action: impl Into<String>,
+        outcome: AuditOutcome,
+    ) -> Result<AuditEntry, VektorError> {
+        let seq_no = (self.inner.entries.len() as u64).saturating_add(1);
+        let prev_hash = self.inner.head_hash;
+        let mut entry = AuditEntry {
+            timestamp_ms,
+            seq_no,
+            actor_key_id: actor_key_id.into(),
+            org_id,
+            action: action.into(),
+            outcome,
+            prev_hash,
+            entry_hash: 0,
+        };
+        entry.entry_hash = entry.compute_entry_hash();
+
+        let frame = encode_audit_frame(&entry)?;
+        self.file
+            .write_all(&frame)
+            .map_err(|e| VektorError::WalIo(e.to_string()))?;
+        self.file
+            .sync_data()
+            .map_err(|e| VektorError::WalIo(e.to_string()))?;
+
+        self.inner.head_hash = entry.entry_hash;
+        self.inner.entries.push(entry.clone());
+        Ok(entry)
+    }
+
+    /// Borrow all verified [`AuditEntry`] records in sequence order.
+    #[must_use]
+    pub fn entries(&self) -> &[AuditEntry] {
+        self.inner.entries()
+    }
+
+    /// Return the latest chained `entry_hash` (`0` when empty).
+    #[must_use]
+    pub const fn head_hash(&self) -> u64 {
+        self.inner.head_hash()
+    }
+
+    /// Borrow the underlying file path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Re-verify the in-memory hash chain from genesis.
+    pub fn verify_integrity(&self) -> Result<usize, u64> {
+        self.inner.verify_integrity()
+    }
+}
+
+fn encode_audit_frame(entry: &AuditEntry) -> Result<Vec<u8>, VektorError> {
+    let actor_bytes = entry.actor_key_id.as_bytes();
+    let org_bytes = entry.org_id.as_str().as_bytes();
+    let action_bytes = entry.action.as_bytes();
+    let reason_bytes = entry.outcome.reason_bytes();
+
+    let payload_len = 8
+        + 8
+        + 8
+        + 8
+        + 1
+        + 4
+        + actor_bytes.len()
+        + 4
+        + org_bytes.len()
+        + 4
+        + action_bytes.len()
+        + 4
+        + reason_bytes.len();
+    let payload_len_u32 = u32::try_from(payload_len)
+        .map_err(|_| VektorError::InvalidConfig("audit entry payload exceeds u32::MAX"))?;
+
+    let mut payload = Vec::with_capacity(payload_len);
+    payload.extend_from_slice(&entry.seq_no.to_le_bytes());
+    payload.extend_from_slice(&entry.timestamp_ms.to_le_bytes());
+    payload.extend_from_slice(&entry.prev_hash.to_le_bytes());
+    payload.extend_from_slice(&entry.entry_hash.to_le_bytes());
+    payload.push(entry.outcome.tag_byte());
+
+    payload.extend_from_slice(&(actor_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(actor_bytes);
+
+    payload.extend_from_slice(&(org_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(org_bytes);
+
+    payload.extend_from_slice(&(action_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(action_bytes);
+
+    payload.extend_from_slice(&(reason_bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(reason_bytes);
+
+    let crc = crc32fast::hash(&payload);
+    let mut frame = Vec::with_capacity(AUDIT_FRAME_HEADER_LEN + payload_len);
+    frame.extend_from_slice(&AUDIT_FRAME_MAGIC);
+    frame.extend_from_slice(&payload_len_u32.to_le_bytes());
+    frame.extend_from_slice(&crc.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+fn read_and_verify_audit_file(file: &mut File) -> Result<AuditLog, VektorError> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|e| VektorError::WalIo(e.to_string()))?;
+
+    let mut entries = Vec::new();
+    let mut expected_prev_hash = 0_u64;
+    let mut cursor = 0_usize;
+
+    while cursor < bytes.len() {
+        let frame_offset = cursor as u64;
+        if bytes.len() - cursor < AUDIT_FRAME_HEADER_LEN {
+            return Err(VektorError::WalCorruption {
+                offset: frame_offset,
+            });
+        }
+        if bytes[cursor..cursor + 4] != AUDIT_FRAME_MAGIC {
+            return Err(VektorError::WalCorruption {
+                offset: frame_offset,
+            });
+        }
+        let payload_len = u32::from_le_bytes([
+            bytes[cursor + 4],
+            bytes[cursor + 5],
+            bytes[cursor + 6],
+            bytes[cursor + 7],
+        ]) as usize;
+        let expected_crc = u32::from_le_bytes([
+            bytes[cursor + 8],
+            bytes[cursor + 9],
+            bytes[cursor + 10],
+            bytes[cursor + 11],
+        ]);
+        cursor += AUDIT_FRAME_HEADER_LEN;
+
+        if bytes.len() - cursor < payload_len {
+            return Err(VektorError::WalCorruption {
+                offset: frame_offset,
+            });
+        }
+        let payload = &bytes[cursor..cursor + payload_len];
+        cursor += payload_len;
+
+        let actual_crc = crc32fast::hash(payload);
+        if actual_crc != expected_crc {
+            return Err(VektorError::WalCorruption {
+                offset: frame_offset,
+            });
+        }
+
+        let entry = decode_audit_payload(payload, frame_offset)?;
+        let expected_seq = (entries.len() as u64).saturating_add(1);
+        if entry.seq_no != expected_seq
+            || entry.prev_hash != expected_prev_hash
+            || entry.compute_entry_hash() != entry.entry_hash
+        {
+            return Err(VektorError::WalCorruption {
+                offset: frame_offset,
+            });
+        }
+        expected_prev_hash = entry.entry_hash;
+        entries.push(entry);
+    }
+
+    let log = AuditLog {
+        entries,
+        head_hash: expected_prev_hash,
+    };
+    if log.verify_integrity().is_err() {
+        return Err(VektorError::WalCorruption { offset: 0 });
+    }
+    Ok(log)
+}
+
+fn decode_audit_payload(payload: &[u8], frame_offset: u64) -> Result<AuditEntry, VektorError> {
+    const FIXED_PREFIX: usize = 8 + 8 + 8 + 8 + 1;
+    if payload.len() < FIXED_PREFIX + 16 {
+        return Err(VektorError::WalCorruption {
+            offset: frame_offset,
+        });
+    }
+    let seq_no = u64::from_le_bytes([
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
+    ]);
+    let timestamp_ms = u64::from_le_bytes([
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+        payload[12],
+        payload[13],
+        payload[14],
+        payload[15],
+    ]);
+    let prev_hash = u64::from_le_bytes([
+        payload[16],
+        payload[17],
+        payload[18],
+        payload[19],
+        payload[20],
+        payload[21],
+        payload[22],
+        payload[23],
+    ]);
+    let entry_hash = u64::from_le_bytes([
+        payload[24],
+        payload[25],
+        payload[26],
+        payload[27],
+        payload[28],
+        payload[29],
+        payload[30],
+        payload[31],
+    ]);
+    let outcome_tag = payload[32];
+
+    let mut pos = FIXED_PREFIX;
+    let actor_key_id = read_len_prefixed_utf8(payload, &mut pos, frame_offset)?;
+    let org_raw = read_len_prefixed_utf8(payload, &mut pos, frame_offset)?;
+    let action = read_len_prefixed_utf8(payload, &mut pos, frame_offset)?;
+    let reason = read_len_prefixed_utf8(payload, &mut pos, frame_offset)?;
+
+    if pos != payload.len() {
+        return Err(VektorError::WalCorruption {
+            offset: frame_offset,
+        });
+    }
+
+    let org_id = OrgId::new(org_raw).map_err(|_| VektorError::WalCorruption {
+        offset: frame_offset,
+    })?;
+    let outcome = match outcome_tag {
+        1 if reason.is_empty() => AuditOutcome::Allowed,
+        2 => AuditOutcome::Denied { reason },
+        _ => {
+            return Err(VektorError::WalCorruption {
+                offset: frame_offset,
+            });
+        }
+    };
+
+    Ok(AuditEntry {
+        timestamp_ms,
+        seq_no,
+        actor_key_id,
+        org_id,
+        action,
+        outcome,
+        prev_hash,
+        entry_hash,
+    })
+}
+
+fn read_len_prefixed_utf8(
+    buf: &[u8],
+    pos: &mut usize,
+    frame_offset: u64,
+) -> Result<String, VektorError> {
+    if buf.len() - *pos < 4 {
+        return Err(VektorError::WalCorruption {
+            offset: frame_offset,
+        });
+    }
+    let len = u32::from_le_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]) as usize;
+    *pos += 4;
+    if buf.len() - *pos < len {
+        return Err(VektorError::WalCorruption {
+            offset: frame_offset,
+        });
+    }
+    let slice = &buf[*pos..*pos + len];
+    *pos += len;
+    std::str::from_utf8(slice)
+        .map(str::to_owned)
+        .map_err(|_| VektorError::WalCorruption {
+            offset: frame_offset,
+        })
+}
+
 /// Unified security gateway combining scoped API-key authentication, RBAC authorization,
 /// per-tenant token-bucket rate limiting and quotas, and tamper-evident audit logging.
 #[derive(Debug, Clone)]
@@ -635,6 +987,31 @@ impl SecurityGate {
             true
         } else {
             false
+        }
+    }
+
+    /// Insert or replace a pre-built [`ScopedApiKey`] record (e.g., replicated from Raft).
+    pub fn upsert_key_record(&mut self, record: ScopedApiKey) {
+        self.keys.insert(record.key_id.clone(), record);
+    }
+
+    /// Look up an existing [`ScopedApiKey`] record by `key_id`.
+    #[must_use]
+    pub fn get_key_record(&self, key_id: &str) -> Option<&ScopedApiKey> {
+        self.keys.get(key_id)
+    }
+
+    /// Synchronize cluster-wide API keys, key revocations, and per-tenant quota policies from a
+    /// committed [`crate::raft::RaftNode`] control-plane state machine.
+    pub fn sync_from_raft(&mut self, raft: &crate::raft::RaftNode, now_ms: u64) {
+        for record in raft.api_keys.values() {
+            self.upsert_key_record(record.clone());
+        }
+        for revoked_id in &raft.revoked_keys {
+            let _ = self.revoke_api_key(revoked_id);
+        }
+        for (org_id, policy) in &raft.tenant_quotas {
+            self.quotas.set_policy(org_id.clone(), *policy, now_ms);
         }
     }
 

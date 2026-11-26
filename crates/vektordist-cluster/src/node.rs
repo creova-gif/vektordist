@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
+use vektordist_core::checkpoint::{CheckpointManifest, ShardCheckpointManager};
 use vektordist_core::hnsw::{HnswIndex, HnswParams};
-use vektordist_core::wal::{replay_into_hnsw, WalLog, WalRecord};
+use vektordist_core::wal::{replay_into_hnsw, WalLog, WalOp, WalRecord};
 use vektordist_core::{ClusterConfig, Epoch, NodeId, SeqNo, ShardId, VektorError};
 use vektordist_proto::v1::shard_replica_rpc_client::ShardReplicaRpcClient;
 use vektordist_proto::v1::shard_replica_rpc_server::ShardReplicaRpc;
@@ -20,6 +21,7 @@ use vektordist_proto::{
     STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_QUORUM_UNAVAILABLE, STATUS_WRONG_EPOCH,
 };
 
+use crate::client::GrpcChannelPool;
 use crate::{u32_to_shard_state, ShardState};
 
 const REPLICATE_RPC_TIMEOUT: Duration = Duration::from_millis(500);
@@ -46,10 +48,13 @@ impl ShardEngine {
         config: &ClusterConfig,
         params: HnswParams,
     ) -> Result<Self, VektorError> {
-        let wal_path = data_dir.join(format!("shard-{shard_id:04}.wal"));
-        let (wal, replay) = WalLog::open(&wal_path, config.dimensions)?;
-        let mut hnsw = HnswIndex::new(config.dimensions, config.metric, params)?;
-        replay_into_hnsw(&replay.records, &mut hnsw)?;
+        let (hnsw, wal, replay, _ckpt) = ShardCheckpointManager::recover_shard(
+            data_dir,
+            shard_id,
+            config.dimensions,
+            config.metric,
+            params,
+        )?;
         Ok(Self {
             shard_id,
             epoch: 1,
@@ -62,6 +67,23 @@ impl ShardEngine {
             wal,
             records_by_seq: replay.records,
         })
+    }
+
+    /// Atomically checkpoint live `HnswIndex` vectors into a zero-tombstone `b"VDSG"` segment +
+    /// `b"VDCK"` manifest, compact the shard WAL on disk, and deduplicate `records_by_seq` in RAM.
+    pub fn checkpoint_and_compact(
+        &mut self,
+        data_dir: &Path,
+    ) -> Result<CheckpointManifest, VektorError> {
+        let manifest = ShardCheckpointManager::create_checkpoint(
+            data_dir,
+            self.shard_id,
+            &self.hnsw,
+            &mut self.wal,
+            &[],
+        )?;
+        self.compact_history();
+        Ok(manifest)
     }
 
     /// Apply records to WAL + HNSW if `seq_no > hnsw.last_seq_no()`.
@@ -90,14 +112,38 @@ impl ShardEngine {
         self.records_by_seq.extend(new_records);
         Ok(self.hnsw.last_seq_no())
     }
+
+    /// Deduplicate `self.records_by_seq` in-place to retain only the latest mutation (`Upsert` or
+    /// `Delete` tombstone) per `VectorId` in strictly ascending `seq_no` order, bounding memory
+    /// across millions of overwrites.
+    pub fn compact_history(&mut self) {
+        if self.records_by_seq.len() <= 1 {
+            return;
+        }
+        let mut seen_ids = HashSet::with_capacity(self.records_by_seq.len());
+        let mut compacted_rev = Vec::with_capacity(self.hnsw.len().saturating_add(16));
+        for rec in self.records_by_seq.iter().rev() {
+            let id = match &rec.op {
+                WalOp::Upsert { id, .. } | WalOp::Delete { id } => *id,
+            };
+            if seen_ids.insert(id) {
+                compacted_rev.push(rec.clone());
+            }
+        }
+        compacted_rev.reverse();
+        compacted_rev.shrink_to_fit();
+        self.records_by_seq = compacted_rev;
+    }
 }
 
-/// Multi-shard gRPC node service hosting 16 independent `RwLock<ShardEngine>` instances.
+/// Multi-shard gRPC node service hosting independent `RwLock<ShardEngine>` instances and a
+/// shared `GrpcChannelPool` for follower WAL replication.
 #[derive(Clone)]
 pub struct NodeService {
     pub node_id: NodeId,
     pub config: ClusterConfig,
     pub shards: Arc<HashMap<ShardId, Arc<RwLock<ShardEngine>>>>,
+    pub channel_pool: GrpcChannelPool,
 }
 
 impl NodeService {
@@ -117,6 +163,7 @@ impl NodeService {
             node_id,
             config,
             shards: Arc::new(map),
+            channel_pool: GrpcChannelPool::new(),
         })
     }
 
@@ -229,24 +276,28 @@ impl ShardReplicaRpc for NodeService {
             REPLICATE_RPC_TIMEOUT
         };
 
-        // Replicate in parallel to all active followers (and dual-stream to recovering follower if present).
+        // Replicate in parallel to all active followers via pooled HTTP/2 channels.
         let mut tasks = Vec::with_capacity(followers.len());
         for addr in followers {
+            let pool = self.channel_pool.clone();
             let wire_clone = wire_records.clone();
             let shard_id = req.shard_id;
             let batched = req.batched_fsync;
             tasks.push(tokio::spawn(async move {
-                replicate_to_peer(&addr, shard_id, epoch, batched, wire_clone, timeout).await
+                replicate_to_peer(&pool, &addr, shard_id, epoch, batched, wire_clone, timeout).await
             }));
         }
 
         if let Some(rec_addr) = recovering_peer {
+            let pool = self.channel_pool.clone();
             let wire_clone = wire_records;
             let shard_id = req.shard_id;
             let batched = req.batched_fsync;
             tokio::spawn(async move {
-                let _ = replicate_to_peer(&rec_addr, shard_id, epoch, batched, wire_clone, timeout)
-                    .await;
+                let _ = replicate_to_peer(
+                    &pool, &rec_addr, shard_id, epoch, batched, wire_clone, timeout,
+                )
+                .await;
             });
         }
 
@@ -473,6 +524,7 @@ impl ShardReplicaRpc for NodeService {
 }
 
 async fn replicate_to_peer(
+    pool: &GrpcChannelPool,
     addr: &str,
     shard_id: ShardId,
     epoch: Epoch,
@@ -480,12 +532,11 @@ async fn replicate_to_peer(
     records: Vec<vektordist_proto::v1::WireWalRecord>,
     timeout: Duration,
 ) -> Result<ReplicateWalResponse, Status> {
-    let endpoint = format_endpoint(addr);
-    let connect_fut = ShardReplicaRpcClient::connect(endpoint);
-    let mut client = tokio::time::timeout(timeout, connect_fut)
+    let channel = pool
+        .get_or_connect(addr, timeout)
         .await
-        .map_err(|_| Status::deadline_exceeded("connect timeout"))?
-        .map_err(|e| Status::unavailable(e.to_string()))?;
+        .map_err(Status::unavailable)?;
+    let mut client = ShardReplicaRpcClient::new(channel);
 
     let rpc_fut = client.replicate_wal(Request::new(ReplicateWalRequest {
         shard_id,
@@ -493,10 +544,17 @@ async fn replicate_to_peer(
         batched_fsync,
         records,
     }));
-    let resp = tokio::time::timeout(timeout, rpc_fut)
-        .await
-        .map_err(|_| Status::deadline_exceeded("replicate_wal timeout"))??;
-    Ok(resp.into_inner())
+    match tokio::time::timeout(timeout, rpc_fut).await {
+        Ok(Ok(resp)) => Ok(resp.into_inner()),
+        Ok(Err(status)) => {
+            pool.evict(addr);
+            Err(status)
+        }
+        Err(_) => {
+            pool.evict(addr);
+            Err(Status::deadline_exceeded("replicate_wal timeout"))
+        }
+    }
 }
 
 #[must_use]

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +28,9 @@ use crate::security::{OrgId, SecurityError, SecurityGate, TenantRole};
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CHAOS_DIR_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Default maximum HTTP request payload size (`16 MiB`) enforced before parsing JSON bodies.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Live cluster & gateway telemetry exported in Prometheus text exposition format (`0.0.4`).
 #[derive(Debug, Clone, PartialEq)]
@@ -271,6 +274,8 @@ pub struct HttpGatewayServer {
     metrics: Arc<RwLock<PrometheusMetrics>>,
     latency_samples_ms: Arc<RwLock<Vec<f64>>>,
     security_gate: Option<Arc<Mutex<SecurityGate>>>,
+    max_body_bytes: usize,
+    draining: Arc<AtomicBool>,
 }
 
 impl HttpGatewayServer {
@@ -288,6 +293,8 @@ impl HttpGatewayServer {
             metrics: Arc::new(RwLock::new(initial)),
             latency_samples_ms: Arc::new(RwLock::new(Vec::new())),
             security_gate: None,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -297,6 +304,25 @@ impl HttpGatewayServer {
     pub fn with_security_gate(mut self, gate: Arc<Mutex<SecurityGate>>) -> Self {
         self.security_gate = Some(gate);
         self
+    }
+
+    /// Configure the maximum allowed HTTP request body size in bytes (default `16 MiB`).
+    /// Requests exceeding `max_bytes` are rejected with `413 Payload Too Large`.
+    #[must_use]
+    pub fn with_max_body_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_body_bytes = max_bytes;
+        self
+    }
+
+    /// Toggle graceful Kubernetes drain state (`true` causes `GET /readyz` to return `503`).
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::SeqCst);
+    }
+
+    /// Return whether this gateway is currently marked as draining for Kubernetes readiness probes.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
     }
 
     /// Return a point-in-time snapshot of `PrometheusMetrics`.
@@ -388,6 +414,19 @@ impl HttpGatewayServer {
             .and_then(|tp| TraceSpan::parse_traceparent(tp).ok())
             .map_or_else(TraceSpan::generate, |parent| parent.child_span());
 
+        let declared_len = parse_content_length(header_block);
+        if declared_len > self.max_body_bytes || body.len() > self.max_body_bytes {
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            return build_http_response(
+                413,
+                "Payload Too Large",
+                "application/json",
+                &span,
+                latency_ms,
+                "{\"status\":\"error\",\"error\":\"payload exceeds max_body_bytes\"}",
+            );
+        }
+
         match (method, path) {
             ("GET", "/healthz") => {
                 self.refresh_cluster_telemetry().await;
@@ -399,6 +438,7 @@ impl HttpGatewayServer {
                 );
                 build_http_response(200, "OK", "application/json", &span, latency_ms, &json)
             }
+            ("GET", "/readyz") => self.handle_readyz(&span, start).await,
             ("GET", "/metrics") => {
                 self.refresh_cluster_telemetry().await;
                 let snap = self.metrics_snapshot();
@@ -424,6 +464,18 @@ impl HttpGatewayServer {
                     return denied_resp;
                 }
                 self.handle_upsert(body, &span, start).await
+            }
+            ("POST", "/v1/upsert_batch") => {
+                if let Err(denied_resp) = self.authorize_http_route(
+                    &req_headers,
+                    TenantRole::Writer,
+                    "http.upsert_batch",
+                    &span,
+                    start,
+                ) {
+                    return denied_resp;
+                }
+                self.handle_upsert_batch(body, &span, start).await
             }
             ("POST", "/v1/delete") => {
                 if let Err(denied_resp) = self.authorize_http_route(
@@ -537,6 +589,105 @@ impl HttpGatewayServer {
             Err(err) => {
                 let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                 Err(map_security_error_response(&err, span, latency_ms))
+            }
+        }
+    }
+
+    async fn handle_readyz(&self, span: &TraceSpan, start: Instant) -> String {
+        self.refresh_cluster_telemetry().await;
+        let draining = self.is_draining();
+        let snap = self.metrics_snapshot();
+        let topo = self.client.cached_topology();
+        let under_quorum_shards = topo
+            .shards
+            .iter()
+            .filter(|s| crate::u32_to_shard_state(s.state) == crate::ShardState::UnderQuorum)
+            .count();
+
+        let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if !draining && snap.active_nodes > 0 && under_quorum_shards == 0 {
+            let json = format!(
+                "{{\"status\":\"ready\",\"draining\":false,\"active_nodes\":{},\"under_quorum_shards\":0}}",
+                snap.active_nodes
+            );
+            build_http_response(200, "OK", "application/json", span, latency_ms, &json)
+        } else {
+            let json = format!(
+                "{{\"status\":\"not_ready\",\"draining\":{draining},\"active_nodes\":{},\"under_quorum_shards\":{under_quorum_shards}}}",
+                snap.active_nodes
+            );
+            build_http_response(
+                503,
+                "Service Unavailable",
+                "application/json",
+                span,
+                latency_ms,
+                &json,
+            )
+        }
+    }
+
+    async fn handle_upsert_batch(&self, body: &str, span: &TraceSpan, start: Instant) -> String {
+        let Some(records) = extract_json_upsert_batch(body) else {
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            return build_http_response(
+                400,
+                "Bad Request",
+                "application/json",
+                span,
+                latency_ms,
+                "{\"status\":\"error\",\"error\":\"missing or invalid 'records'\"}",
+            );
+        };
+
+        match self.client.upsert_batch(&records).await {
+            Ok(upserted) => {
+                self.update_metrics(|m| {
+                    m.acked_writes_total = m.acked_writes_total.saturating_add(upserted as u64);
+                    m.indexed_vectors = m.indexed_vectors.saturating_add(upserted as u64);
+                });
+                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let resp_json = format!(
+                    "{{\"status\":\"ok\",\"upserted\":{upserted},\"trace_id\":\"{}\"}}",
+                    span.trace_id
+                );
+                build_http_response(200, "OK", "application/json", span, latency_ms, &resp_json)
+            }
+            Err(
+                err @ (VektorError::DimensionMismatch { .. }
+                | VektorError::InvalidVector(_)
+                | VektorError::InvalidConfig(_)),
+            ) => {
+                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let resp_json = format!(
+                    "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
+                    escape_json_str(&err.to_string()),
+                    span.trace_id
+                );
+                build_http_response(
+                    400,
+                    "Bad Request",
+                    "application/json",
+                    span,
+                    latency_ms,
+                    &resp_json,
+                )
+            }
+            Err(err) => {
+                let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let resp_json = format!(
+                    "{{\"status\":\"error\",\"error\":\"{}\",\"trace_id\":\"{}\"}}",
+                    escape_json_str(&err.to_string()),
+                    span.trace_id
+                );
+                build_http_response(
+                    503,
+                    "Service Unavailable",
+                    "application/json",
+                    span,
+                    latency_ms,
+                    &resp_json,
+                )
             }
         }
     }
@@ -778,10 +929,29 @@ pub async fn spawn_http_gateway(
         while let Ok((mut stream, _)) = listener.accept().await {
             let gw = gateway.clone();
             tokio::spawn(async move {
-                if let Ok(req_str) = read_full_http_request(&mut stream).await {
-                    let resp_str = gw.handle_http_request(&req_str).await;
-                    let _ = stream.write_all(resp_str.as_bytes()).await;
-                    let _ = stream.shutdown().await;
+                match read_full_http_request(&mut stream, gw.max_body_bytes).await {
+                    Ok(HttpReadOutcome::Complete(req_str)) => {
+                        let resp_str = gw.handle_http_request(&req_str).await;
+                        let _ = stream.write_all(resp_str.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                    Ok(HttpReadOutcome::PayloadTooLarge { traceparent }) => {
+                        let span = traceparent
+                            .as_deref()
+                            .and_then(|tp| TraceSpan::parse_traceparent(tp).ok())
+                            .map_or_else(TraceSpan::generate, |p| p.child_span());
+                        let resp_str = build_http_response(
+                            413,
+                            "Payload Too Large",
+                            "application/json",
+                            &span,
+                            0.0,
+                            "{\"status\":\"error\",\"error\":\"payload exceeds max_body_bytes\"}",
+                        );
+                        let _ = stream.write_all(resp_str.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                    Err(_) => {}
                 }
             });
         }
@@ -812,25 +982,40 @@ pub async fn send_http_request(
     raw_req.push_str("\r\n");
     raw_req.push_str(body);
 
-    stream
-        .write_all(raw_req.as_bytes())
-        .await
-        .map_err(|e| VektorError::WalIo(format!("http write error: {e}")))?;
+    let write_res = stream.write_all(raw_req.as_bytes()).await;
 
     let mut resp_bytes = Vec::new();
-    stream
-        .read_to_end(&mut resp_bytes)
-        .await
-        .map_err(|e| VektorError::WalIo(format!("http read error: {e}")))?;
+    let read_res = stream.read_to_end(&mut resp_bytes).await;
+    if !resp_bytes.is_empty() {
+        let raw_resp = String::from_utf8_lossy(&resp_bytes);
+        if let Ok(parsed) = parse_http_response(&raw_resp) {
+            return Ok(parsed);
+        }
+    }
+
+    write_res.map_err(|e| VektorError::WalIo(format!("http write error: {e}")))?;
+    read_res.map_err(|e| VektorError::WalIo(format!("http read error: {e}")))?;
 
     let raw_resp = String::from_utf8_lossy(&resp_bytes);
     parse_http_response(&raw_resp)
 }
 
-async fn read_full_http_request(stream: &mut TcpStream) -> Result<String, std::io::Error> {
+enum HttpReadOutcome {
+    Complete(String),
+    PayloadTooLarge { traceparent: Option<String> },
+}
+
+async fn read_full_http_request(
+    stream: &mut TcpStream,
+    max_body_bytes: usize,
+) -> Result<HttpReadOutcome, std::io::Error> {
+    const MAX_HEADER_BYTES: usize = 32 * 1024;
+    const DRAIN_CAP_BYTES: usize = 1024 * 1024;
+
     let mut buf = Vec::with_capacity(2048);
-    let mut chunk = [0_u8; 1024];
-    let mut expected_total_len: Option<usize> = None;
+    let mut chunk = [0_u8; 4096];
+    let mut header_end_opt: Option<usize> = None;
+    let mut declared_content_len: usize = 0;
 
     loop {
         let n = stream.read(&mut chunk).await?;
@@ -839,21 +1024,61 @@ async fn read_full_http_request(stream: &mut TcpStream) -> Result<String, std::i
         }
         buf.extend_from_slice(&chunk[..n]);
 
-        if expected_total_len.is_none() {
+        if header_end_opt.is_none() {
             if let Some(header_end) = find_header_end(&buf) {
+                header_end_opt = Some(header_end);
                 let header_str = String::from_utf8_lossy(&buf[..header_end]);
-                let content_len = parse_content_length(&header_str);
-                expected_total_len = Some(header_end + content_len);
+                declared_content_len = parse_content_length(&header_str);
+                let traceparent = extract_header_value(&header_str, "traceparent");
+                if declared_content_len > max_body_bytes {
+                    let already_read_body = buf.len().saturating_sub(header_end);
+                    let remaining = declared_content_len.saturating_sub(already_read_body);
+                    drain_bounded_bytes(stream, remaining.min(DRAIN_CAP_BYTES)).await;
+                    return Ok(HttpReadOutcome::PayloadTooLarge { traceparent });
+                }
+            } else if buf.len() > MAX_HEADER_BYTES {
+                return Ok(HttpReadOutcome::PayloadTooLarge { traceparent: None });
             }
         }
-        if let Some(total) = expected_total_len {
-            if buf.len() >= total {
+
+        if let Some(header_end) = header_end_opt {
+            let body_read = buf.len().saturating_sub(header_end);
+            if body_read > max_body_bytes {
+                let header_str = String::from_utf8_lossy(&buf[..header_end]);
+                let traceparent = extract_header_value(&header_str, "traceparent");
+                return Ok(HttpReadOutcome::PayloadTooLarge { traceparent });
+            }
+            if buf.len() >= header_end.saturating_add(declared_content_len) {
                 break;
             }
         }
     }
 
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(HttpReadOutcome::Complete(
+        String::from_utf8_lossy(&buf).into_owned(),
+    ))
+}
+
+async fn drain_bounded_bytes(stream: &mut TcpStream, mut remaining: usize) {
+    let mut scratch = [0_u8; 4096];
+    while remaining > 0 {
+        let to_read = remaining.min(scratch.len());
+        match stream.read(&mut scratch[..to_read]).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => remaining = remaining.saturating_sub(n),
+        }
+    }
+}
+
+fn extract_header_value(header_str: &str, name: &str) -> Option<String> {
+    for line in header_str.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -1083,6 +1308,75 @@ fn extract_json_f32_array(json: &str, key: &str) -> Option<Vec<f32>> {
         out.push(val);
     }
     Some(out)
+}
+
+fn extract_json_upsert_batch(json: &str) -> Option<Vec<(VectorId, WriteId, Vec<f32>)>> {
+    let pattern = "\"records\"";
+    let start_idx = json.find(pattern)? + pattern.len();
+    let rest = json.get(start_idx..)?.trim_start();
+    let after_colon = rest.strip_prefix(':')?.trim_start();
+    let after_open = after_colon.strip_prefix('[')?;
+
+    let array_end = find_matching_delimiter(after_open, b'[', b']')?;
+    let inner = after_open.get(..array_end)?.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut records = Vec::new();
+    let mut cursor = inner;
+    while !cursor.is_empty() {
+        cursor = cursor.trim_start();
+        if let Some(stripped) = cursor.strip_prefix(',') {
+            cursor = stripped.trim_start();
+        }
+        if cursor.is_empty() {
+            break;
+        }
+        let after_brace = cursor.strip_prefix('{')?;
+        let obj_end = find_matching_delimiter(after_brace, b'{', b'}')?;
+        let obj_body = after_brace.get(..obj_end)?;
+
+        let id = extract_json_u64(obj_body, "id")?;
+        let write_id = extract_json_u64(obj_body, "write_id").unwrap_or(id);
+        let vector = extract_json_f32_array(obj_body, "vector")?;
+        records.push((id, write_id, vector));
+
+        cursor = after_brace.get(obj_end + 1..)?.trim_start();
+    }
+
+    Some(records)
+}
+
+fn find_matching_delimiter(input: &str, open: u8, close: u8) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut depth = 1_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+        } else if b == open {
+            depth = depth.saturating_add(1);
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 fn escape_json_str(s: &str) -> String {

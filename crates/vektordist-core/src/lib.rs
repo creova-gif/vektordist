@@ -4,6 +4,7 @@
 pub mod adaptive;
 pub mod agentic;
 pub mod arena;
+pub mod checkpoint;
 pub mod exact;
 pub mod hnsw;
 pub mod hybrid;
