@@ -8,16 +8,16 @@ immediately without native C-extension build steps.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from email.message import Message
 import json
 import os
 import time
-from typing import Any, TypeAlias
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from email.message import Message
+from typing import Any, TypeAlias
 
 MAX_RETRY_BACKOFF_CAP_SECS: float = 2.0
 
@@ -175,14 +175,14 @@ def _parse_json_object(raw_body: str) -> dict[str, Any]:
         return {}
     parsed: object = json.loads(raw_body)
     if not isinstance(parsed, dict):
-        raise ValueError("expected JSON object from VektorDist gateway")
+        raise TypeError("expected JSON object from VektorDist gateway")
     return {str(k): v for k, v in parsed.items()}
 
 
 def _try_parse_json_object(raw_body: str) -> dict[str, Any]:
     try:
         return _parse_json_object(raw_body)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError):
         return {}
 
 
@@ -625,7 +625,7 @@ class VektorDistClient:
                 trace_id = _extract_header_case_insensitive(headers, "x-trace-id")
                 try:
                     parsed = _parse_json_object(raw_body)
-                except (json.JSONDecodeError, ValueError) as exc:
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     raise VektorDistError(
                         status_code,
                         f"invalid JSON response from {path}: {exc}",

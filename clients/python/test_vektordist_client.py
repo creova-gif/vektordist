@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import re
 import threading
-from typing import Any
 import unittest
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 from clients.python.vektordist_client import (
     AuthenticationError,
@@ -59,16 +59,16 @@ class _GatewayTestServer(ThreadingHTTPServer):
 class _GatewayRequestHandler(BaseHTTPRequestHandler):
     server: _GatewayTestServer
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+    def log_message(self, format: str, *args: object) -> None:
         return
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         self._dispatch("GET")
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         self._dispatch("POST")
 
-    def do_DELETE(self) -> None:  # noqa: N802
+    def do_DELETE(self) -> None:
         self._dispatch("DELETE")
 
     def _dispatch(self, method: str) -> None:
@@ -354,7 +354,7 @@ class VektorDistClientTest(unittest.TestCase):
         self.state = MockGatewayState()
         self.httpd = _GatewayTestServer(("127.0.0.1", 0), self.state)
         host, port = self.httpd.server_address[0], self.httpd.server_address[1]
-        self.base_url = f"http://{str(host)}:{port}"
+        self.base_url = f"http://{host!s}:{port}"
         self.server_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.server_thread.start()
 
