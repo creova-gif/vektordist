@@ -20,7 +20,7 @@ crc32fast = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tonic = "0.12"
+tonic = "0.14"
 prost = "0.13"
 tonic-build = "0.12"
 ratatui = "0.30"
