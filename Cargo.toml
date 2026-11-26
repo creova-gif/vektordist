@@ -21,8 +21,8 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.12"
 prost = "0.13"
 tonic-build = "0.12"
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 vektordist-core = { path = "crates/vektordist-core" }
 vektordist-proto = { path = "crates/vektordist-proto" }
 vektordist-cluster = { path = "crates/vektordist-cluster" }
