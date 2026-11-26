@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Rust workspace crates (`Cargo.toml` / `Cargo.lock`)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps):"
+    reviewers:
+      - "creova-gif"
+    labels:
+      - "dependencies"
+      - "rust"
+
+  # GitHub Actions CI & multi-arch release workflows (`.github/workflows/*`)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps):"
+    reviewers:
+      - "creova-gif"
+    labels:
+      - "dependencies"
+      - "ci"

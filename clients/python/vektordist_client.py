@@ -1,14 +1,15 @@
 """Zero-dependency typed Python client SDK for VektorDist.
 
 Communicates with the VektorDist zero-trust HTTP/1.1 REST gateway using only the
-Python standard library (`urllib.request`, `json`, `os`, `time`, `dataclasses`,
-`typing`) so AI, RAG, and agentic workloads on Python 3.11+ / 3.12+ can import it
-immediately without native C-extension build steps.
+Python standard library (`urllib.request`, `json`, `math`, `os`, `time`,
+`dataclasses`, `typing`) so AI, RAG, and agentic workloads on Python 3.11+ / 3.12+
+can import it immediately without native C-extension build steps.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import urllib.error
@@ -20,6 +21,12 @@ from email.message import Message
 from typing import Any, TypeAlias
 
 MAX_RETRY_BACKOFF_CAP_SECS: float = 2.0
+VALID_METRICS: tuple[str, ...] = ("cosine", "l2")
+VALID_QUANTIZATIONS: tuple[str, ...] = ("f32", "fp16", "sq8", "bq")
+_QUANTIZATION_ALIASES: Mapping[str, str] = {
+    "f16": "fp16",
+    "half": "fp16",
+}
 
 BatchRecord: TypeAlias = (
     tuple[int, Sequence[float]]
@@ -133,6 +140,22 @@ def generate_traceparent(sampled: bool = True) -> str:
     return f"00-{trace_id}-{span_id}-{flags}"
 
 
+def _coerce_finite_vector(vector: Sequence[float]) -> list[float]:
+    if isinstance(vector, (str, bytes, bytearray)):
+        raise TypeError("vector must be a sequence of finite numbers")
+    out: list[float] = []
+    for raw in vector:
+        if isinstance(raw, bool):
+            raise TypeError("vector coordinates must be numbers, not bool")
+        val = float(raw)
+        if not math.isfinite(val):
+            raise ValueError("vector coordinates must be finite numbers")
+        out.append(val)
+    if not out:
+        raise ValueError("vector must not be empty")
+    return out
+
+
 def _is_valid_traceparent(header: str) -> bool:
     parts = header.strip().split("-")
     if len(parts) != 4 or parts[0] != "00":
@@ -225,7 +248,9 @@ class VektorDistClient:
 
         self._base_url: str = _normalize_base_url(base_url)
         self._bearer_token: str | None = (
-            bearer_token.strip() if bearer_token is not None and bearer_token.strip() else None
+            bearer_token.strip()
+            if bearer_token is not None and bearer_token.strip()
+            else None
         )
         self._org_id: str = org_id.strip()
         self._timeout_secs: float = timeout_secs
@@ -262,9 +287,13 @@ class VektorDistClient:
         if status_code in (200, 503):
             try:
                 return _parse_json_object(raw_body)
-            except (json.JSONDecodeError, ValueError) as exc:
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 trace_id = _extract_header_case_insensitive(headers, "x-trace-id")
-                raise VektorDistError(status_code, f"invalid JSON in /readyz: {exc}", trace_id) from exc
+                raise VektorDistError(
+                    status_code,
+                    f"invalid JSON in /readyz: {exc}",
+                    trace_id,
+                ) from exc
         self._raise_http_error(status_code, headers, raw_body)
         return {}
 
@@ -277,11 +306,12 @@ class VektorDistClient:
         traceparent: str | None = None,
     ) -> UpsertAck:
         """Perform a `W=2` quorum-durable vector upsert via `POST /v1/upsert`."""
+        coerced_vec = _coerce_finite_vector(vector)
         resolved_write_id = id if write_id is None else write_id
         payload: dict[str, Any] = {
             "id": int(id),
             "write_id": int(resolved_write_id),
-            "vector": [float(v) for v in vector],
+            "vector": coerced_vec,
         }
         data, resp_trace_id = self._request_json(
             "POST",
@@ -308,12 +338,17 @@ class VektorDistClient:
             if isinstance(entry, Mapping):
                 rec_id = int(entry["id"])
                 rec_write_id = int(entry.get("write_id", rec_id))
-                raw_vec = entry["vector"]
+                raw_vec: object = entry["vector"]
+                if not isinstance(raw_vec, Sequence) or isinstance(
+                    raw_vec,
+                    (str, bytes, bytearray),
+                ):
+                    raise TypeError("batch record 'vector' must be a sequence of floats")
                 serialized.append(
                     {
                         "id": rec_id,
                         "write_id": rec_write_id,
-                        "vector": [float(x) for x in raw_vec],
+                        "vector": _coerce_finite_vector(raw_vec),
                     }
                 )
             elif len(entry) == 2:
@@ -322,7 +357,7 @@ class VektorDistClient:
                     {
                         "id": int(rec_id_2),
                         "write_id": int(rec_id_2),
-                        "vector": [float(x) for x in vec_2],
+                        "vector": _coerce_finite_vector(vec_2),
                     }
                 )
             elif len(entry) == 3:
@@ -331,11 +366,13 @@ class VektorDistClient:
                     {
                         "id": int(rec_id_3),
                         "write_id": int(rec_wid_3),
-                        "vector": [float(x) for x in vec_3],
+                        "vector": _coerce_finite_vector(vec_3),
                     }
                 )
             else:
-                raise ValueError("each batch record must be a 2-tuple, 3-tuple, or mapping")
+                raise ValueError(
+                    "each batch record must be a 2-tuple, 3-tuple, or mapping"
+                )
 
         data, _ = self._request_json(
             "POST",
@@ -345,7 +382,10 @@ class VektorDistClient:
         )
         upserted = data.get("upserted")
         if not isinstance(upserted, int) or isinstance(upserted, bool):
-            raise VektorDistError(200, "missing integer 'upserted' in upsert_batch response")
+            raise VektorDistError(
+                200,
+                "missing integer 'upserted' in upsert_batch response",
+            )
         return upserted
 
     def search(
@@ -357,8 +397,9 @@ class VektorDistClient:
         traceparent: str | None = None,
     ) -> list[ScoredHit]:
         """Execute a distributed scatter-gather search via `POST /v1/search`."""
+        coerced_query = _coerce_finite_vector(query)
         payload: dict[str, Any] = {
-            "query": [float(v) for v in query],
+            "query": coerced_query,
             "top_k": int(top_k),
             "ef_search": int(ef_search),
         }
@@ -406,13 +447,34 @@ class VektorDistClient:
         traceparent: str | None = None,
     ) -> dict[str, Any]:
         """Create an isolated named vector collection via `POST /v1/collections`."""
-        if not name.strip():
+        cleaned_name = name.strip()
+        if not cleaned_name:
             raise ValueError("collection name must not be empty")
+        if isinstance(dimensions, bool):
+            raise TypeError("dimensions must be a positive integer")
+        dims_int = int(dimensions)
+        if dims_int <= 0:
+            raise ValueError("dimensions must be > 0")
+
+        norm_metric = metric.strip().lower()
+        if norm_metric not in VALID_METRICS:
+            raise ValueError(
+                f"unsupported metric {metric!r}; expected one of {VALID_METRICS}"
+            )
+
+        raw_quant = quantization.strip().lower()
+        norm_quant = _QUANTIZATION_ALIASES.get(raw_quant, raw_quant)
+        if norm_quant not in VALID_QUANTIZATIONS:
+            raise ValueError(
+                f"unsupported quantization {quantization!r}; "
+                f"expected one of {VALID_QUANTIZATIONS}"
+            )
+
         payload: dict[str, Any] = {
-            "name": name,
-            "dimensions": int(dimensions),
-            "metric": metric,
-            "quantization": quantization,
+            "name": cleaned_name,
+            "dimensions": dims_int,
+            "metric": norm_metric,
+            "quantization": norm_quant,
         }
         data, _ = self._request_json(
             "POST",
@@ -465,9 +527,10 @@ class VektorDistClient:
     ) -> dict[str, Any]:
         """Upsert a vector into a named collection via `POST /v1/collections/{name}/upsert`."""
         encoded = self._encode_collection_name(collection)
+        coerced_vec = _coerce_finite_vector(vector)
         payload: dict[str, Any] = {
             "id": int(id),
-            "vector": [float(v) for v in vector],
+            "vector": coerced_vec,
         }
         if write_id is not None:
             payload["write_id"] = int(write_id)
@@ -490,8 +553,9 @@ class VektorDistClient:
     ) -> list[ScoredHit]:
         """Search a named collection via `POST /v1/collections/{name}/search`."""
         encoded = self._encode_collection_name(collection)
+        coerced_query = _coerce_finite_vector(query)
         payload: dict[str, Any] = {
-            "query": [float(v) for v in query],
+            "query": coerced_query,
             "top_k": int(top_k),
             "ef_search": int(ef_search),
         }
@@ -601,7 +665,10 @@ class VektorDistClient:
         except urllib.error.URLError as url_err:
             raise VektorDistError(0, f"transport error: {url_err.reason}") from url_err
         except TimeoutError as timeout_err:
-            raise VektorDistError(0, f"request timed out after {self._timeout_secs}s") from timeout_err
+            raise VektorDistError(
+                0,
+                f"request timed out after {self._timeout_secs}s",
+            ) from timeout_err
         except OSError as os_err:
             raise VektorDistError(0, f"socket I/O error: {os_err}") from os_err
 

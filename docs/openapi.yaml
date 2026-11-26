@@ -1,17 +1,21 @@
 openapi: 3.1.0
 info:
   title: VektorDist HTTP/1.1 REST & Observability Gateway API
-  version: 0.3.0
-  summary: Distributed sharded HNSW vector search engine with quorum WAL durability and multi-collection management.
+  version: "0.4.0"
+  summary: Distributed sharded HNSW vector search engine with quorum WAL durability, durable FP16 multi-collections, and zero-trust web console.
   description: |
-    Zero-trust HTTP/1.1 REST, multi-collection management, and Prometheus observability
-    specification for **VektorDist**.
+    Zero-trust HTTP/1.1 REST, durable multi-collection management (`f32`, `fp16`, `sq8`, `bq`),
+    embedded accessible Web Control Console, and Prometheus observability specification for **VektorDist**.
 
-    ### Authentication, Multi-Tenancy & Distributed Tracing
+    ### Authentication, Multi-Tenancy, Hardening & Distributed Tracing
     - **Bearer Auth (`BearerAuth`):** Scoped `vdk.<key_id>.<hex_tag>` tokens verified in
       constant time by `SecurityGate` with monotonic RBAC roles (`Reader`, `Writer`, `Admin`).
     - **Tenant Isolation (`X-Org-Id`):** Enforces structural per-organization isolation and
       token-bucket rate quotas (`429 Too Many Requests` with `Retry-After`).
+    - **HTTP Hardening & Security Headers:** Rejects RFC 9112 `Transfer-Encoding` and conflicting
+      `Content-Length` smuggling vectors, non-finite `NaN`/`Inf` floats, and `%2e%2e` path traversal,
+      and emits `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `Cache-Control: no-store`
+      (plus `Content-Security-Policy` on `GET /` and `GET /console`).
     - **W3C Trace Context (`traceparent`):** Accepts `00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>`,
       spawns child spans, and returns `traceparent` + `x-trace-id` on every response.
   license:
@@ -23,6 +27,8 @@ servers:
     description: Local VektorDist HTTP/1.1 gateway
 
 tags:
+  - name: Console
+    description: Embedded zero-trust accessible Web Control Console (`text/html` with strict `Content-Security-Policy`).
   - name: Observability
     description: Liveness, Kubernetes quorum readiness, Prometheus metrics, and OpenAPI schema discovery.
   - name: Vectors
@@ -30,9 +36,65 @@ tags:
   - name: Cluster & Security
     description: Topology inspection and cryptographic hash-chained audit verification.
   - name: Collections
-    description: Named multi-collection lifecycle (`f32`, `fp16`, `sq8`, `bq`) and collection-scoped vector operations.
+    description: Durable named multi-collection lifecycle (`f32`, `fp16`, `sq8`, `bq` persisted in `collections.vdcl`) and collection-scoped vector operations.
 
 paths:
+  /:
+    get:
+      tags: [Console]
+      operationId: getRootWebConsole
+      summary: Interactive Zero-Trust Web Control Console (root entry point)
+      parameters:
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Self-contained WCAG-accessible HTML control console protected by strict Content-Security-Policy.
+          headers:
+            Content-Security-Policy:
+              $ref: "#/components/headers/ContentSecurityPolicy"
+            X-Content-Type-Options:
+              $ref: "#/components/headers/XContentTypeOptions"
+            X-Frame-Options:
+              $ref: "#/components/headers/XFrameOptions"
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
+            x-trace-id:
+              $ref: "#/components/headers/XTraceId"
+            traceparent:
+              $ref: "#/components/headers/Traceparent"
+          content:
+            "text/html; charset=utf-8":
+              schema:
+                type: string
+
+  /console:
+    get:
+      tags: [Console]
+      operationId: getWebConsole
+      summary: Interactive Zero-Trust Web Control Console (`/console` alias)
+      parameters:
+        - $ref: "#/components/parameters/TraceparentHeader"
+      responses:
+        "200":
+          description: Self-contained WCAG-accessible HTML control console protected by strict Content-Security-Policy.
+          headers:
+            Content-Security-Policy:
+              $ref: "#/components/headers/ContentSecurityPolicy"
+            X-Content-Type-Options:
+              $ref: "#/components/headers/XContentTypeOptions"
+            X-Frame-Options:
+              $ref: "#/components/headers/XFrameOptions"
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
+            x-trace-id:
+              $ref: "#/components/headers/XTraceId"
+            traceparent:
+              $ref: "#/components/headers/Traceparent"
+          content:
+            "text/html; charset=utf-8":
+              schema:
+                type: string
+
   /healthz:
     get:
       tags: [Observability]
@@ -44,6 +106,12 @@ paths:
         "200":
           description: Gateway process is alive.
           headers:
+            X-Content-Type-Options:
+              $ref: "#/components/headers/XContentTypeOptions"
+            X-Frame-Options:
+              $ref: "#/components/headers/XFrameOptions"
+            Cache-Control:
+              $ref: "#/components/headers/CacheControl"
             x-trace-id:
               $ref: "#/components/headers/XTraceId"
             traceparent:
@@ -542,6 +610,25 @@ components:
       description: Propagated child W3C `traceparent` span header.
       schema:
         type: string
+    XContentTypeOptions:
+      description: Prevents MIME-sniffing response interpretation (`nosniff`).
+      schema:
+        type: string
+        enum: [nosniff]
+    XFrameOptions:
+      description: Prevents clickjacking iframe embedding (`DENY`).
+      schema:
+        type: string
+        enum: [DENY]
+    CacheControl:
+      description: Disables intermediate caching of authenticated API and console responses (`no-store`).
+      schema:
+        type: string
+        default: no-store
+    ContentSecurityPolicy:
+      description: Strict Content-Security-Policy locking down the embedded Zero-Trust Web Control Console.
+      schema:
+        type: string
 
   responses:
     BadRequestError:
@@ -813,8 +900,9 @@ components:
           default: cosine
         quantization:
           type: string
-          enum: [f32, fp16, sq8, bq]
-          default: f32
+          enum: ["f32", "fp16", "sq8", "bq"]
+          default: "f32"
+          description: Per-collection vector quantization tier (`f32` full precision, `fp16` IEEE 754 binary16 2x, `sq8` 4x scalar, `bq` 32x binary).
 
     CollectionInfo:
       type: object

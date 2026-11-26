@@ -10,8 +10,9 @@ Security patches are published for the latest minor release series:
 
 | Version | Supported |
 | --- | --- |
-| `0.3.x` | Yes |
-| `0.2.x` | Security fixes only |
+| `0.4.x` | Yes |
+| `0.3.x` | Security fixes only |
+| `0.2.x` | No |
 | `0.1.x` | No |
 | `< 0.1.0` | No |
 
@@ -60,11 +61,16 @@ VektorDist enforces defense-in-depth across its gateway, cluster control plane, 
 - Every `Allowed` and `Denied` authorization check appends an `AuditEntry` whose 64-bit `entry_hash` chains `prev_hash` (anchored at genesis `0`) with `(timestamp_ms, seq_no, actor_key_id, org_id, action, outcome)`.
 - `AuditLog::verify_integrity()` recomputes the full chain from genesis and pinpoints the exact `corrupted_seq_no` if any historical entry is modified, deleted, truncated, or reordered.
 
-### 4. Fail-Closed Storage Integrity (`WalLog`, `PersistentVectorSegment`, `SnapshotManager`)
-- Every write-ahead log record (`*.wal`), persistent zero-copy vector segment (`*.vdsg`), and point-in-time cluster snapshot carries IEEE CRC32 checksums.
+### 4. Fail-Closed Storage Integrity (`WalLog`, `PersistentVectorSegment`, `SnapshotManager`, `CollectionRegistry`)
+- Every write-ahead log record (`*.wal`), persistent zero-copy vector segment (`*.vdsg`), shard checkpoint (`*.vdck`), durable multi-collection snapshot (`collections.vdcl`), and point-in-time cluster snapshot carries IEEE CRC32 checksums.
 - Mid-file bit-rot or tampered snapshot payloads fail closed with `VektorError::WalCorruption` rather than silently serving corrupt embeddings.
 
-### 5. Code & Container Hardening
+### 5. HTTP Ingress, Smuggling & Browser Isolation Defenses (`HttpGatewayServer`)
+- **RFC 9112 Request Smuggling Rejection:** Requests carrying `Transfer-Encoding`, conflicting/non-numeric `Content-Length` headers, obs-fold continuations, or null bytes fail closed at socket framing with `400 Bad Request`.
+- **Adversarial Input Validation:** String-literal-aware JSON key extraction prevents key-shadowing payloads; non-finite coordinates (`NaN`, `Infinity`) and percent-encoded path traversal (`%2e%2e%2f`) are deterministically rejected before touching storage engines.
+- **Air-Gapped Console Security Headers:** Every HTTP response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store`, while `/console` enforces a strict zero-CDN `Content-Security-Policy` (`default-src 'none'; connect-src 'self'; frame-ancestors 'none'`) and scopes bearer tokens exclusively to ephemeral `sessionStorage`.
+
+### 6. Code & Container Hardening
 - `#![deny(clippy::unwrap_used, clippy::expect_used)]` across all production targets prevents untrusted inputs from triggering panics.
 - Continuous `cargo audit --deny warnings` runs on every push and pull request in CI.
 - Production container images (`deploy/Dockerfile`) run as `nonroot:nonroot` (`UID/GID 65532`) on `gcr.io/distroless/cc-debian12:nonroot` with no shell or package manager.

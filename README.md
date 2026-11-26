@@ -7,7 +7,7 @@
 
 **VektorDist** is a laptop-first, distributed sharded HNSW vector and hybrid retrieval engine engineered in Rust from first principles.
 
-It combines hardware-accelerated SIMD kernels (`ARM NEON` / portable SIMD), multi-tier quantization (`SQ8` 4x, `PQ` 16x, `BQ` 32x), zero-copy persistent vector segments (`VDSG`), `W=2` of `RF=3` IEEE CRC32 write-ahead log quorum replication, Raft topology consensus, strict `OrgId` multi-tenant BM25 + RRF hybrid search, programmable AI agent memory & ColBERT `MaxSim` late interaction, and a zero-trust authenticated HTTP/1.1 + Prometheus gateway—all verifiable on a single machine with live `SIGKILL` chaos injection and zero acknowledged write loss (`acked_writes_lost == 0`).
+It combines hardware-accelerated SIMD kernels (`ARM NEON` / portable SIMD), multi-tier quantization (`FP16` 2x, `SQ8` 4x, `PQ` 16x, `BQ` 32x), zero-copy persistent vector segments (`VDSG`), atomic shard & collection checkpoints (`VDCK`, `VDCL`), `W=2` of `RF=3` IEEE CRC32 write-ahead log quorum replication, Raft topology & security consensus, strict `OrgId` multi-tenant BM25 + RRF hybrid search, programmable AI agent memory & ColBERT `MaxSim` late interaction, zero-dependency Rust & Python SDKs, and an embedded WCAG 2.1 AA Web Control Console + zero-trust HTTP/1.1 & Prometheus gateway—all verifiable on a single machine with live `SIGKILL` chaos injection and zero acknowledged write loss (`acked_writes_lost == 0`).
 
 ![VektorDist Interactive TUI Dashboard](docs/assets/tui-dashboard.svg)
 
@@ -56,11 +56,11 @@ flowchart LR
 
 | Subsystem | Capabilities | Key Types & Modules |
 | --- | --- | --- |
-| **Storage, SIMD & Quantization** | Contiguous cache-aligned `f32` arenas, 4x4-lane unrolled `ARM NEON` & portable SIMD kernels, layered HNSW with tombstones, `SQ8` (**4x** compression, asymmetric `f32 x u8` SIMD + `3x` rerank), `PQ` (**16x** subspace k-means + `ADC` tables), `BQ` (**32x** 1-bit `XOR + POPCNT` + rerank), 8-byte-aligned `PersistentVectorSegment` (`VDSG`) with CRC32, and `TieredCompactor` 100% tombstone reclamation. | `VectorArena`, `HnswIndex`, `Sq8HnswIndex`, `PqIndex`, `BqIndex`, `PersistentVectorSegment`, `TieredCompactor` |
-| **Consensus, Replication & Failover** | Deterministic 16-shard SplitMix64 ring, `W=2` of `RF=3` IEEE CRC32 `fsync` WAL durability, `STATUS_WRONG_EPOCH` lease fencing, union WAL anti-entropy failover reconciliation (`acknowledged_writes_lost == 0`), replacement replica catch-up (`RECOVERING -> HEALTHY`), Raft topology consensus, online shard migration, Power-of-Two-Choices (`P2C`) routing, and closed-loop `AdaptiveSearchController` (`ef_search`). | `WalLog`, `CoordinatorService`, `RaftNode`, `ShardEngine`, `ClusterClient`, `AdaptiveRouter`, `AdaptiveSearchController` |
-| **Enterprise Retrieval & Zero-Trust Security** | Structural `OrgId` multi-tenant isolation (`0` cross-tenant leakage), one-stage in-graph `MetadataFilter` HNSW traversal (`Eq`, `In`, `Range`, `And`, `Or`), lexical BM25 + Reciprocal Rank Fusion (`RRF`) hybrid search, constant-time 256-bit MAC API keys (`vdk.<key_id>.<hex_tag>`), monotonic RBAC (`Reader < Writer < Admin`), per-tenant token-bucket QPS & storage quotas, and hash-chained tamper-evident `AuditLog`. | `OrgId`, `MetadataFilter`, `MultiTenantHybridEngine`, `SecurityGate`, `TenantQuotaTracker`, `AuditLog` |
+| **Storage, SIMD & Quantization** | Contiguous cache-aligned `f32` arenas, 4x4-lane unrolled `ARM NEON` & portable SIMD kernels, generation-stamped zero-alloc `VisitedPool` HNSW with tombstones, `FP16` (**2x** IEEE 754 `binary16`), `SQ8` (**4x** asymmetric `f32 x u8` SIMD + `3x` rerank), `PQ` (**16x** subspace k-means + `ADC` tables), `BQ` (**32x** 1-bit `XOR + POPCNT` + rerank), zero-copy `PersistentVectorSegment` (`VDSG`), atomic `ShardCheckpointManager` (`VDCK`), durable `CollectionRegistry` (`VDCL`), and `TieredCompactor`. | `VectorArena`, `HnswIndex`, `Fp16HnswIndex`, `Sq8HnswIndex`, `PqIndex`, `BqIndex`, `PersistentVectorSegment`, `ShardCheckpointManager`, `CollectionRegistry` |
+| **Consensus, Replication & Failover** | Deterministic 16-shard SplitMix64 ring, `W=2` of `RF=3` IEEE CRC32 `fsync` WAL durability, `(WriteId, op_tag)` idempotent write deduplication, `STATUS_WRONG_EPOCH` lease fencing, union WAL anti-entropy failover reconciliation (`acknowledged_writes_lost == 0`), Raft topology & security consensus, online shard migration (`rebalance.rs`), Power-of-Two-Choices (`P2C`) routing, and closed-loop `AdaptiveSearchController` (`ef_search`). | `WalLog`, `CoordinatorService`, `RaftNode`, `ShardEngine`, `ClusterClient`, `AdaptiveRouter`, `AdaptiveSearchController` |
+| **Enterprise Retrieval & Zero-Trust Security** | Structural `OrgId` multi-tenant isolation (`0` cross-tenant leakage), one-stage in-graph `MetadataFilter` HNSW traversal (`Eq`, `In`, `Range`, `And`, `Or`), lexical BM25 + Reciprocal Rank Fusion (`RRF`) hybrid search, constant-time 256-bit MAC API keys (`vdk.<key_id>.<hex_tag>`), monotonic RBAC (`Reader < Writer < Admin`), RFC 9112 request-smuggling & Slowloris `408` guards, per-tenant token-bucket QPS & storage quotas, and hash-chained `PersistentAuditLog` (`VAUD`). | `OrgId`, `MetadataFilter`, `MultiTenantHybridEngine`, `SecurityGate`, `TenantQuotaTracker`, `PersistentAuditLog` |
 | **AI Agent Memory & Late Interaction** | Multi-tenant `AgentMemoryStore` ranking episodic memories by composite semantic similarity + exponential recency decay + intrinsic importance with greedy `max_token_budget` context packing, multi-vector token-level `ColbertIndex` (`MaxSim` SIMD late interaction), and `(OrgId, filter_hash)`-partitioned `SemanticCache` with TTL & FIFO bounds. | `AgentMemoryStore`, `ColbertIndex`, `SemanticCache` |
-| **Observability, Operations & Chaos** | Zero-dependency HTTP/1.1 REST gateway (`/v1/upsert`, `/v1/search`, `/v1/delete`, `/v1/topology`, `/v1/audit`, `/healthz`), Prometheus `0.0.4` `/metrics` exporter, W3C `traceparent` span propagation, point-in-time `SnapshotManager` (`create`, `verify`, `restore`), interactive `ratatui` cluster TUI, and programmable `ChaosCampaign` SLA verifier. | `HttpGatewayServer`, `PrometheusMetrics`, `TraceSpan`, `SnapshotManager`, `ChaosCampaign`, `DemoClusterSupervisor` |
+| **Web Console, TUI, SDKs & Chaos** | Embedded zero-CDN WCAG 2.1 AA Web Control Console (`GET /`, `GET /console` with strict `CSP`), zero-dependency HTTP/1.1 REST & OpenAPI `3.1.0` gateway, typed Rust (`HttpVektorClient`) & Python (`VektorDistClient`) SDKs, Prometheus `0.0.4` `/metrics`, W3C `traceparent` spans, `SnapshotManager`, accessible `ratatui` TUI (`[?]` Help modal & compact mode), and `ChaosCampaign` SLA verifier. | `HttpGatewayServer`, `HttpVektorClient`, `VektorDistClient`, `PrometheusMetrics`, `TraceSpan`, `SnapshotManager`, `ChaosCampaign` |
 
 ---
 
@@ -83,7 +83,7 @@ Prebuilt archives with SHA-256 checksums are published on [GitHub Releases](http
 
 ```bash
 TARGET="aarch64-apple-darwin" # or x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
-VERSION="v0.1.0"
+VERSION="v0.4.0"
 
 curl -fsSLO "https://github.com/creova-gif/vektordist/releases/download/${VERSION}/vektordist-${TARGET}.tar.gz"
 curl -fsSLO "https://github.com/creova-gif/vektordist/releases/download/${VERSION}/vektordist-${TARGET}.tar.gz.sha256"
@@ -98,8 +98,11 @@ sudo install -m 0755 "vektordist-${TARGET}/vektordist" /usr/local/bin/vektordist
 [`deploy/Dockerfile`](deploy/Dockerfile) compiles a static release binary and packages it on `gcr.io/distroless/cc-debian12:nonroot` (`UID/GID 65532`):
 
 ```bash
-docker build -f deploy/Dockerfile -t vektordist:0.1.0 .
-docker run --rm -p 50051:50051 -p 8080:8080 vektordist:0.1.0 chaos --nodes 5 --vectors 800 --dimensions 128
+docker build -f deploy/Dockerfile -t vektordist:0.4.0 .
+docker run --rm -p 50051:50051 -p 8080:8080 vektordist:0.4.0 chaos --nodes 5 --vectors 800 --dimensions 128
+
+# Or launch a full 3-node + Coordinator + Gateway + Prometheus local cluster:
+docker compose -f deploy/docker-compose.yml up --build
 ```
 
 ### 4. Kubernetes `StatefulSet`
@@ -155,10 +158,11 @@ vektordist node \
   --num-shards 16 \
   --write-quorum 2
 
-# Launch the authenticated HTTP/1.1 REST & Prometheus /metrics gateway
+# Launch the Zero-Trust HTTP/1.1 REST, Web Control Console (/console) & Prometheus gateway
 vektordist gateway \
   --coord 127.0.0.1:50051 \
-  --listen 127.0.0.1:8080
+  --listen 127.0.0.1:8080 \
+  --collections-dir /var/lib/vektordist/collections
 ```
 
 ### Scoped Zero-Trust API Token Provisioning (`keygen`)
@@ -221,13 +225,14 @@ Every HTTP response includes `x-trace-id`, W3C `traceparent`, and `x-latency-ms`
 
 | Method & Path | Required Role | Description |
 | --- | --- | --- |
-| `POST /v1/upsert` | `Writer` | Quorum-write (`W=2`) a vector with `id`, optional `write_id`, and `vector` payload. |
+| `GET /`, `GET /console` | Public (Session Auth in UI) | Embedded zero-CDN WCAG 2.1 AA Web Control Console (`Content-Security-Policy` isolated). |
+| `POST /v1/upsert` | `Writer` | Quorum-write (`W=2`) a vector with `id`, optional `write_id`, and finite `vector` payload. |
 | `POST /v1/upsert_batch` | `Writer` | Partition and quorum-write (`W=2`, `1 fsync` per shard) a multi-vector batch. |
 | `POST /v1/search` | `Reader` | Scatter-gather ANN search (`query`, `top_k`, `ef_search`) returning ranked `(id, score)` hits. |
 | `POST /v1/delete` | `Writer` | Tombstone-delete a vector ID across its shard replicas. |
 | `GET /v1/topology` | `Reader` | Inspect live cluster nodes, shard epochs, primary assignments, and replica states. |
 | `GET /v1/audit` | `Admin` | Inspect hash-chained `AuditLog` entries and chain integrity verification status. |
-| `POST /v1/collections` | `Admin` | Create a named multi-tenant collection (`name`, `dimensions`, `metric`, `quantization`). |
+| `POST /v1/collections` | `Admin` | Create a durable collection (`name`, `dimensions`, `metric`, `quantization`: `f32`\|`fp16`\|`sq8`\|`bq`). |
 | `GET /v1/collections` | `Reader` | List registered collections with live vector counts and memory footprints. |
 | `DELETE /v1/collections/{name}` | `Admin` | Drop a named collection and reclaim its memory. |
 | `POST /v1/collections/{name}/upsert` | `Writer` | Tenant-isolated vector upsert within a named collection. |
@@ -337,13 +342,14 @@ Measured locally on **Apple M5 (`aarch64-apple-darwin`, 10 cores, 24 GB unified 
 ```text
 vektordist/
 ├── Cargo.toml                        # Workspace manifest (Apache-2.0, Rust 2021)
-├── src/                              # CLI binary, VektorNodeConfig, supervisor & ratatui TUI
+├── .env.example                      # Declarative VEKTORDIST_* environment & secret template
+├── src/                              # CLI binary, VektorNodeConfig, supervisor & accessible ratatui TUI
 ├── crates/
-│   ├── vektordist-core/              # Arenas, SIMD, HNSW, SQ8/PQ/BQ, Mmap, Hybrid, Agentic & WAL
+│   ├── vektordist-core/              # Arenas, SIMD, HNSW, FP16/SQ8/PQ/BQ, Mmap, Hybrid, Agentic & WAL
 │   ├── vektordist-proto/             # Protobuf schema & checked-in Tonic/Prost gRPC stubs
-│   └── vektordist-cluster/           # Coordinator, Raft, ShardEngine, Snapshots, Security & Gateway
+│   └── vektordist-cluster/           # Coord, Raft, Rebalancer, ShardEngine, Security, Gateway & Console
 ├── clients/
-│   └── python/                       # Zero-dependency typed Python SDK (mypy --strict)
+│   └── python/                       # Zero-dependency typed Python SDK (ruff + mypy --strict)
 ├── examples/                         # End-to-end runnable Rust examples (hybrid & agentic RAG)
 ├── tests/                            # Workspace-level multi-process failover E2E tests
 ├── deploy/
@@ -354,19 +360,21 @@ vektordist/
 │   └── gcp/main.tf                   # GCP Compute Engine + pd-ssd Terraform module
 ├── docs/
 │   ├── assets/tui-dashboard.svg      # Interactive TUI dashboard capture
-│   ├── adr/                          # Architecture Decision Records (ADR-000 .. ADR-019)
+│   ├── adr/                          # Architecture Decision Records (ADR-000 .. ADR-021)
+│   ├── ARCHITECTURE.md               # C4 architecture, quorum sequence diagrams & binary wire specs
 │   ├── openapi.yaml                  # OpenAPI 3.1.0 REST gateway contract
 │   ├── OPERATIONS.md                 # Enterprise SRE & production operations runbook
 │   ├── BENCHMARKS.md                 # Hardware benchmark report & reproduction commands
 │   ├── FAILURE_MODEL.md              # Quorum durability, fencing & failure mode matrix
 │   └── THREAT_MODEL.md               # Trust boundaries, assets & zero-trust mitigations
-└── .github/                          # CI, multi-arch Release workflow & issue/PR templates
+└── .github/                          # CI, Release, CODEOWNERS, Dependabot & issue/PR templates
 ```
 
 ---
 
 ## Architecture Decision Records & Core Docs
 
+- **System Architecture & Binary Wire Reference:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - **Production SRE Operations Runbook:** [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
 - **Failure Model & Consistency Guarantees:** [`docs/FAILURE_MODEL.md`](docs/FAILURE_MODEL.md)
 - **Benchmark Report & Hardware Reproduction:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
@@ -392,6 +400,8 @@ vektordist/
   - [`ADR-017`](docs/adr/017-m17-gateway-hardening-and-write-idempotency.md) — Modular Gateway Split, Bounded Latency Ring, Slowloris `408` Defense & `WriteId` Idempotency
   - [`ADR-018`](docs/adr/018-m18-multi-collection-namespace-engine.md) — Multi-Collection Namespace Registry & `/v1/collections/*` API
   - [`ADR-019`](docs/adr/019-m19-openapi-python-sdk-and-compose-stack.md) — OpenAPI 3.1 Contract, Zero-Dependency Typed Python SDK & Turnkey Docker Compose Stack
+  - [`ADR-020`](docs/adr/020-gateway-request-smuggling-defense-and-durable-fp16-collections.md) — HTTP Request Smuggling Defense, Adversarial JSON Hardening & Durable `FP16` Collections (`VDCL`)
+  - [`ADR-021`](docs/adr/021-embedded-zero-trust-web-console-and-accessible-tui.md) — Embedded Zero-Trust WCAG 2.1 AA Web Control Console & Accessible Responsive TUI
 
 ---
 
