@@ -2,12 +2,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 use tonic::transport::Server;
 use vektordist::cli::{percentile, run_node_server};
+use vektordist::config::{derive_master_secret, VektorNodeConfig};
 use vektordist::tui::run_demo_ui;
 use vektordist_cluster::backup::SnapshotManager;
 use vektordist_cluster::client::ClusterClient;
@@ -16,6 +18,7 @@ use vektordist_cluster::gateway::{
     spawn_http_gateway, ChaosCampaign, ChaosStep, HttpGatewayServer,
 };
 use vektordist_cluster::node::NodeService;
+use vektordist_cluster::security::{OrgId, SecurityGate, TenantQuotaPolicy, TenantRole};
 use vektordist_core::adaptive::{AdaptiveSearchConfig, AdaptiveSearchController};
 use vektordist_core::exact::{ExactIndex, SeededRng};
 use vektordist_core::hnsw::{recall_at_k, HnswIndex, HnswParams};
@@ -54,27 +57,29 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         headless: bool,
     },
-    /// Run a single shard replica node process.
+    /// Run a single shard replica node process (via `--config` file, `VEKTORDIST_*` env vars, or flags).
     Node {
         #[arg(long)]
-        id: u32,
-        #[arg(long, default_value = "127.0.0.1:0")]
-        listen: String,
-        #[arg(long, default_value = "/tmp/vektordist-node")]
-        data_dir: PathBuf,
-        #[arg(long, default_value_t = 768)]
-        dimensions: usize,
-        #[arg(long, default_value_t = 16)]
-        num_shards: u32,
-        #[arg(long, default_value_t = 2)]
-        write_quorum: u8,
+        config: Option<PathBuf>,
+        #[arg(long)]
+        id: Option<u32>,
+        #[arg(long)]
+        listen: Option<String>,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long)]
+        dimensions: Option<usize>,
+        #[arg(long)]
+        num_shards: Option<u32>,
+        #[arg(long)]
+        write_quorum: Option<u8>,
     },
     /// Run a standalone M1 authoritative topology coordinator.
     Coord {
         #[arg(long, default_value = "127.0.0.1:50051")]
         listen: String,
     },
-    /// Run local indexing and search benchmarks (Exact, HNSW f32, SQ8 u8, and M6 Adaptive).
+    /// Run local indexing and search benchmarks (Exact, HNSW f32, SQ8 u8, BQ 1-bit, and M6 Adaptive).
     Bench {
         #[arg(long, default_value_t = 100_000)]
         vectors: usize,
@@ -92,12 +97,27 @@ enum Commands {
         #[command(subcommand)]
         action: SnapshotAction,
     },
-    /// Run the HTTP/1.1 REST (`/v1/upsert`, `/v1/search`, `/healthz`) and Prometheus `/metrics` gateway.
+    /// Run the HTTP/1.1 REST (`/v1/upsert`, `/v1/search`, `/v1/delete`, `/healthz`) and Prometheus `/metrics` gateway.
     Gateway {
         #[arg(long, default_value = "127.0.0.1:50051")]
         coord: String,
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
+        #[arg(long)]
+        master_secret: Option<String>,
+    },
+    /// Issue a tenant-scoped zero-trust `vdk.<key_id>.<hex_tag>` bearer token.
+    Keygen {
+        #[arg(long)]
+        secret: Option<String>,
+        #[arg(long, default_value = "default")]
+        org: String,
+        #[arg(long, default_value = "writer")]
+        role: String,
+        #[arg(long, default_value = "key-01")]
+        key_id: String,
+        #[arg(long, default_value_t = 1)]
+        nonce: u64,
     },
     /// Run an automated multi-step Jepsen-style fault-injection & SLA campaign.
     Chaos {
@@ -168,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Commands::Node {
+            config,
             id,
             listen,
             data_dir,
@@ -175,7 +196,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_shards,
             write_quorum,
         } => {
-            run_node_server(id, &listen, &data_dir, dimensions, num_shards, write_quorum).await?;
+            let mut node_cfg = match config {
+                Some(ref path) => VektorNodeConfig::from_file(path)?,
+                None => VektorNodeConfig::default(),
+            };
+            node_cfg.apply_env_overrides()?;
+            if let Some(v) = id {
+                node_cfg.node_id = v;
+            }
+            if let Some(v) = listen {
+                node_cfg.listen_addr = v;
+            }
+            if let Some(v) = data_dir {
+                node_cfg.data_dir = v;
+            }
+            if let Some(v) = dimensions {
+                node_cfg.dimensions = v;
+            }
+            if let Some(v) = num_shards {
+                node_cfg.num_shards = v;
+            }
+            if let Some(v) = write_quorum {
+                node_cfg.write_quorum = v;
+            }
+            node_cfg.validate()?;
+            run_node_server(
+                node_cfg.node_id,
+                &node_cfg.listen_addr,
+                &node_cfg.data_dir,
+                node_cfg.dimensions,
+                node_cfg.num_shards,
+                node_cfg.write_quorum,
+            )
+            .await?;
         }
         Commands::Coord { listen } => {
             let coord = CoordinatorService::new(
@@ -249,14 +302,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
-        Commands::Gateway { coord, listen } => {
+        Commands::Gateway {
+            coord,
+            listen,
+            master_secret,
+        } => {
             let client = ClusterClient::connect(&coord).await?;
-            let gw = HttpGatewayServer::new(client);
+            let secret_opt = master_secret
+                .or_else(|| std::env::var("VEKTORDIST_MASTER_SECRET").ok())
+                .filter(|s| !s.trim().is_empty());
+            let gw = if let Some(secret_str) = secret_opt {
+                let gate = SecurityGate::new(
+                    derive_master_secret(&secret_str),
+                    TenantQuotaPolicy::default(),
+                );
+                HttpGatewayServer::new(client).with_security_gate(Arc::new(Mutex::new(gate)))
+            } else {
+                HttpGatewayServer::new(client)
+            };
             let (bound_addr, handle) = spawn_http_gateway(&listen, gw).await?;
             println!(
                 "vektordist HTTP/1.1 REST & Prometheus gateway listening on http://{bound_addr} (upstream coord={coord})"
             );
             let _ = handle.await;
+        }
+        Commands::Keygen {
+            secret,
+            org,
+            role,
+            key_id,
+            nonce,
+        } => {
+            let secret_raw = secret
+                .or_else(|| std::env::var("VEKTORDIST_MASTER_SECRET").ok())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "vektordist-dev-master-secret".to_string());
+            let parsed_role = match role.to_ascii_lowercase().as_str() {
+                "reader" => TenantRole::Reader,
+                "writer" => TenantRole::Writer,
+                "admin" => TenantRole::Admin,
+                _ => {
+                    return Err("invalid --role: expected reader, writer, or admin".into());
+                }
+            };
+            let org_id = OrgId::new(org)?;
+            let mut gate = SecurityGate::new(
+                derive_master_secret(&secret_raw),
+                TenantQuotaPolicy::default(),
+            );
+            let (raw_token, record) = gate.issue_api_key(&key_id, org_id, parsed_role, nonce);
+            println!("token={raw_token}");
+            println!(
+                "key_id={} org={} role={}",
+                record.key_id,
+                record.org_id.as_str(),
+                record.role
+            );
         }
         Commands::Chaos {
             nodes,

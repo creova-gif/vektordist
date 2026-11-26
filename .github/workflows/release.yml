@@ -52,7 +52,7 @@ jobs:
         run: |
           mkdir -p dist/${{ matrix.archive_name }}
           cp target/${{ matrix.target }}/release/vektordist dist/${{ matrix.archive_name }}/
-          cp README.md dist/${{ matrix.archive_name }}/ 2>/dev/null || true
+          cp README.md LICENSE CHANGELOG.md dist/${{ matrix.archive_name }}/
           tar -C dist -czf dist/${{ matrix.archive_name }}.tar.gz ${{ matrix.archive_name }}
           cd dist
           shasum -a 256 ${{ matrix.archive_name }}.tar.gz > ${{ matrix.archive_name }}.tar.gz.sha256

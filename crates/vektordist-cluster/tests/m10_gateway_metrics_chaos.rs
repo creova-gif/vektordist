@@ -186,6 +186,7 @@ async fn automated_chaos_campaign_executes_multi_step_failover_with_zero_write_l
         metric: DistanceMetric::Cosine,
     };
 
+    let p95_sla_ms = if cfg!(debug_assertions) { 250.0 } else { 50.0 };
     let campaign = ChaosCampaign::new(
         config,
         vec![1, 2, 3],
@@ -218,7 +219,7 @@ async fn automated_chaos_campaign_executes_multi_step_failover_with_zero_write_l
                 top_k: 10,
                 ef_search: 64,
                 min_recall_at_10: 0.95,
-                max_p95_ms: 50.0,
+                max_p95_ms: p95_sla_ms,
                 seed: 404,
             },
         ],
@@ -234,8 +235,8 @@ async fn automated_chaos_campaign_executes_multi_step_failover_with_zero_write_l
         report.measured_recall_at_10
     );
     assert!(
-        report.measured_p95_ms <= 50.0,
-        "expected p95 <= 50.0 ms, got {}",
+        report.measured_p95_ms <= p95_sla_ms,
+        "expected p95 <= {p95_sla_ms} ms, got {}",
         report.measured_p95_ms
     );
     assert!(report.sla_passed);

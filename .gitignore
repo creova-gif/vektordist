@@ -1,9 +1,42 @@
+# Rust / Cargo build outputs
 /target
 **/*.rs.bk
-.DS_Store
+
+# Release packaging & temporary directories
+/dist/
+/tmp/
+/snapshots/
+
+# VektorDist runtime WAL, segments, and local cluster state
+*.wal
+*.vdsg
+vektordist-demo-*/
+
+# Environment & local secrets (never commit credentials)
 .env
 .env.*
+!.env.example
+
+# Agent & local tooling scratchpads
 .agents/
 .gstack/
-*.wal
-/tmp/
+
+# macOS & Linux OS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+
+# Editors & IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Profiling & coverage artifacts
+lcov.info
+perf.data
+perf.data.old
+flamegraph.svg

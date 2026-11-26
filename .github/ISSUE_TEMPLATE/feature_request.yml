@@ -1,0 +1,64 @@
+name: Feature Request
+description: Propose a new storage optimization, distributed systems capability, API endpoint, or operational enhancement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Propose an enhancement to **VektorDist**. Non-trivial architectural changes follow our ADR process (`docs/adr/000-template.md`).
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement & Workload Context
+      description: What production or developer bottleneck does this solve? Include scale parameters (vector count, dimensions, QPS, latency SLA, tenant count) where relevant.
+      placeholder: "When running 500+ tenants with skewed vector counts, operators need..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Target Subsystem
+      options:
+        - "Storage & Indexing (HNSW, SIMD, Quantization, Mmap, Compaction)"
+        - "Distributed Consensus, Sharding & Replication"
+        - "Enterprise Retrieval (Hybrid Search, Filtering, Multi-Tenancy)"
+        - "AI Agent Memory, ColBERT & Semantic Caching"
+        - "Security, RBAC, Quotas & Audit Logging"
+        - "HTTP/gRPC API, CLI, TUI & Observability"
+        - "Cloud Deployment (Docker, Kubernetes, Terraform)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Design / CLI / API Surface
+      description: Describe the proposed behavior, wire format, configuration keys, or API endpoints.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Performance, Memory, Durability & Security Trade-offs
+      description: How does this affect RAM per vector, p95/p99 latency, WAL durability (`W=2`), or tenant isolation?
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Other approaches you evaluated and why this design is preferred.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution Readiness
+      options:
+        - label: I am willing to author an ADR (`docs/adr/000-template.md`) and submit a pull request for this feature.
